@@ -69,7 +69,7 @@ impl EventHandler for Handler {
 
         let target = CONFIG.target_guild.map(|id| GuildId(id));
         
-        let commands = register_commands!(&ctx, target, [HelloCommand])
+        let commands = register_commands!(&ctx, target, [HelloCommand, RollCommand])
             .expect("Unable to register commands");
                 
         info!("Registered {} commands", commands.len());

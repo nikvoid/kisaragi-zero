@@ -27,11 +27,14 @@ use prelude::*;
 
 mod emoji;
 mod hello;
+mod roll;
 
 pub use hello::HelloCommand;
+pub use roll::RollCommand;
 pub use emoji::{try_send_emoji, send_emoji_list};
 
 #[derive(Debug, slashies_macros::Commands)]
 pub enum BotCommands {
     Hello(HelloCommand),
+    Roll(RollCommand),
 }
