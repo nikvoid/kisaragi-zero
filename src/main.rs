@@ -1,6 +1,4 @@
 #![feature(fs_try_exists)]
-#![feature(try_blocks)]
-#![feature(result_option_inspect)]
 
 use once_cell::sync::Lazy;
 use serenity::{

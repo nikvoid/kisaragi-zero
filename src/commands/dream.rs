@@ -1,61 +1,48 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use once_cell::sync::Lazy;
+use serenity::builder::CreateEmbed;
 use serenity::model::prelude::Attachment;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::oneshot;
-use crate::config::SdapiBackend;
-use crate::sdapi::{WebuiRequestTxt2Img, SdApi, WebuiRequestImg2Img, WebuiInfo};
+use crate::sdapi::{GenerationRequest, SdApi, ImageVec};
 use super::prelude::*;
 
+/// Wrapper for choosing backend
+macro_rules! sd_generate {
+    ($req:expr) => { 
+        match $crate::CONFIG.sdapi_backend {
+            $crate::config::SdapiBackend::Webui => $crate::sdapi::WEBUI.generate($req)
+        }    
+    } 
+}
 
 enum DreamTask {
-    Dream(DreamCommand, oneshot::Sender<anyhow::Result<(Vec<Vec<u8>>, String)>>),
+    Dream(DreamCommand, oneshot::Sender<anyhow::Result<(ImageVec, GenerationRequest)>>),
 }
+
+/// Is currently generating
+static GENERATING: AtomicBool = AtomicBool::new(false);
 
 /// Dream command executor
 static DREAM_POOL: Lazy<Sender<DreamTask>> = Lazy::new(|| { 
     let (tx, mut rx) = tokio::sync::mpsc::channel(32);
     tokio::spawn(async move { 
         while let Some(msg) = rx.recv().await {
-            match crate::CONFIG.sdapi_backend {
-                // Swith on backend
-                SdapiBackend::Webui => match msg {
-                    // /dream
-                    DreamTask::Dream(cmd, back_tx) => {
-                        // Send request
-                        let resp: anyhow::Result<_> = try {
-                            match &cmd.init_image {
-                                Some(img) => {
-                                    let req = WebuiRequestImg2Img {
-                                        init_images: {
-                                            let raw = img.download().await?;
-                                            let b64 = base64::encode(raw);
-                                            vec![b64] 
-                                        },
-                                        txt2img: cmd.into(),
-                                    };
-                                    crate::sdapi::WEBUI.img2img(req)
-                                },
-                                None => crate::sdapi::WEBUI.txt2img(cmd.into())
-                            }
-                            .await
-                            .map(|r| {
-                                // decode base64
-                                let imgs: Vec<_> = r.images.into_iter()
-                                    .filter_map(|s| match base64::decode(s) {
-                                        Ok(bytes) => Some(bytes),
-                                        Err(e) => {
-                                            error!(?e, "Failed to decode base64");
-                                            None
-                                        },
-                                    })
-                                    .collect();
-                                (imgs, r.info)
-                            })?
-                        };
-                        back_tx.send(resp).ok();
-                    },
+            // Indicate state
+            GENERATING.store(true, Ordering::SeqCst);
+            match msg {
+                DreamTask::Dream(cmd, back_tx) => {
+                    let res = cmd.into_request()
+                        .await
+                        .map(|req| sd_generate!(req));
+                    match res {
+                        Ok(r) => back_tx.send(r.await).ok(),
+                        Err(e) => back_tx.send(Err(e)).ok(),
+                    };
                 },
             }
+            GENERATING.store(false, Ordering::SeqCst);
         }
     }); 
     tx
@@ -106,50 +93,51 @@ pub struct DreamCommand {
     #[min = 0.0]
     #[max = 1.0]
     denoising_strength: Option<f64>,
-    /// Do not add default keywords to prompts
-    no_default_keywords: Option<bool>,
-    /// LoRa that will be appended to prompt
+    /// Do not add default keywords to prompt
+    no_default_prompt: Option<bool>,
+    /// Do not add default keywords to negative prompt
+    no_default_neg_prompt: Option<bool>,
+    // TODO: Restrict this
+    /// Count of images to generate. Will be ignored if not from admin
+    #[min = 1]
+    #[max = 16]
+    batch_size: Option<i64>,
+    /// LoRa that will be appended to prompt.
+    /// Only for webui backend
     #[choice("ryukishi")]
     lora: Option<String>,
 }
 
-impl From<DreamCommand> for WebuiRequestTxt2Img {    
-    fn from(mut value: DreamCommand) -> Self {
-        let lora = value.lora.map(|lora| match lora.as_str() {
+impl DreamCommand {
+    /// Convert dream command input into request, optionally downloading image
+    async fn into_request(mut self) -> anyhow::Result<GenerationRequest> {
+        let lora = self.lora.map(|lora| match lora.as_str() {
             "ryukishi" => ", <lora:ryukishi07Higurashi_v1:1>",
-            _ => panic!("unknown lora"),
+            _ => "",
         });
 
         if let Some(lora) = lora {
-            value.prompt.push_str(lora)
+            self.prompt.push_str(lora);
         }
         
-        let mut def = Self::default();
-        Self {
-            prompt: if matches!(value.no_default_keywords, Some(true)) {
-                value.prompt
-            } else {
-                def.prompt.push_str(&value.prompt);
-                def.prompt
+        Ok(GenerationRequest {
+            prompt: self.prompt,
+            neg_prompt: self.negative_prompt,
+            seed: self.seed,
+            sampler: self.sampler_name,
+            steps: self.steps.map(|s| s as _),
+            scale: self.cfg_scale.map(|s| s as _),
+            strength: self.denoising_strength,
+            width: self.width.map(|w| w as _),
+            height: self.height.map(|h| h as _),
+            batch: self.batch_size.map(|b| b as _),
+            no_default_prompt: self.no_default_prompt.unwrap_or(false),
+            no_default_neg_prompt: self.no_default_neg_prompt.unwrap_or(false),
+            init_images: match self.init_image {
+                Some(init) => Some(vec![init.download().await?]),
+                None => None,
             },
-            seed: value.seed.unwrap_or(def.seed),
-            sampler_name: value.sampler_name.unwrap_or(def.sampler_name),
-            steps: value.steps.unwrap_or(def.steps as _) as _,
-            cfg_scale: value.cfg_scale.unwrap_or(def.cfg_scale as _) as _,
-            width: value.width.unwrap_or(def.width as _) as _,
-            height: value.height.unwrap_or(def.height as _) as _,
-            denoising_strength: value.denoising_strength.unwrap_or(def.denoising_strength),
-            negative_prompt: match (value.no_default_keywords, value.negative_prompt) {
-                (Some(true), Some(p)) => p,
-                (Some(true), None) => String::new(),
-                (Some(false) | None, None) => def.negative_prompt, 
-                (None | Some(false), Some(p)) => {
-                    def.negative_prompt.push_str(&p);
-                    def.negative_prompt
-                },
-            },
-            ..def
-        }
+        })
     }
 }
 
@@ -160,8 +148,9 @@ impl ApplicationCommandInteractionHandler for DreamCommand {
         ctx: &Context,
         command: &ApplicationCommandInteraction,
     ) -> Result<(), InvocationError> {
-        // Send task to executor
-        let queue_pos = DREAM_POOL.max_capacity() - DREAM_POOL.capacity();
+        // Send queue pos response
+        let busy = GENERATING.load(Ordering::Relaxed);
+        let queue_pos = DREAM_POOL.max_capacity() - DREAM_POOL.capacity() + busy as usize;
         command
             .create_interaction_response(&ctx.http, |response| response
                 .kind(InteractionResponseType::ChannelMessageWithSource)
@@ -177,43 +166,50 @@ impl ApplicationCommandInteractionHandler for DreamCommand {
             .await
             .map_err(|_| InvocationError)?;
 
+        // Capture time
+        let start_time = tokio::time::Instant::now();
+
         // Wait on response
         let result = rx.await.map_err(|_| InvocationError)?;
         command
             .create_followup_message(&ctx.http, |response| match &result {
                 Ok((imgs, info)) => {
-                    let info = {
-                        let slice = info.as_bytes().get(0..info.len() - 0);
-                        if let Some(info) = slice {
-                            let inf: WebuiInfo = serde_json::from_slice(info)
-                                .inspect_err(|e| error!(e = ?e, full = std::str::from_utf8(info).unwrap(), "failed to get info"))
-                                .unwrap_or(WebuiInfo {
-                                infotexts: vec!["error".to_string()]
-                            });
-                            inf.infotexts[0].clone()
-                        } else {
-                            "nothing".to_string()
-                        }
-                    };
-                    // info!("{info}");
+                    let comp_time = start_time.elapsed();
+                    let imgs: Vec<_> = imgs
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, img)|
+                            (img, format!("{idx}.png"))
+                        )
+                        .collect();
+                    let mut img_iter = imgs.iter();
                     let resp = response                       
                         .content(&command.user)
                         .embed(|embed| { 
                             let mut embed = embed 
                                 .title("Generation result")
-                                .attachment("result.png")
-                                .field("Parameters", info, false);
+                                .description(format!("Compute used: {:.2} sec", comp_time.as_secs_f32()))
+                                .field("Prompt", &info.prompt, false)                                
+                                .opt_field("Negative prompt", info.neg_prompt.as_ref(), false)
+                                .opt_field("Seed", info.seed, true)
+                                .opt_field("Sampler", info.sampler.as_ref(), true)
+                                .opt_field("Steps", info.steps, true)
+                                .opt_field("Scale", info.scale, true)
+                                .opt_field("Strength", info.strength, true)
+                                .opt_field("Width", info.width, true)
+                                .opt_field("Height", info.height, true)
+                                .attachment("result.png");
 
                             if let Some(ref att) = self.init_image {
-                                // embed = embed.field("Original image", "", false);
                                 embed = embed.thumbnail(&att.url)
                             }
 
                             embed
-                            // TODO: Original img for img2img
                         });
-                        // FIXME: Actually only one image processed
-                        resp.add_files(imgs.iter().map(|img| (img.as_slice(), "result.png")))
+                        if let Some((first, _)) = img_iter.next() {
+                            resp.add_file((first.as_slice(), "result.png"));
+                        }
+                        resp.add_files(img_iter.map(|(img, name)| (img.as_slice(), name.as_str())))
                 }
                 Err(err) => {
                     response
@@ -227,5 +223,26 @@ impl ApplicationCommandInteractionHandler for DreamCommand {
             .await
             .map_err(|e| {error!(?e, "dream failed"); InvocationError })?;
         Ok(())
+    }
+}
+
+trait CreateEmbedExt {
+    fn opt_field<T, U>(&mut self, name: T, value: Option<U>, inline: bool) -> &mut Self
+    where     
+        T: ToString,
+        U: ToString;
+}
+
+impl CreateEmbedExt for CreateEmbed {
+    fn opt_field<T, U>(&mut self, name: T, value: Option<U>, inline: bool) -> &mut Self
+    where     
+        T: ToString,
+        U: ToString 
+    {
+        if let Some(val) = value {
+            self.field(name, val, inline)
+        } else {
+            self
+        }
     }
 }

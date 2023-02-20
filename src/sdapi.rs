@@ -1,25 +1,186 @@
 use once_cell::sync::Lazy;
 use serde::{Serialize, Deserialize};
 use serenity::async_trait;
-use reqwest::Client;
+use reqwest::{Client, StatusCode};
+use base64::{Engine, engine::general_purpose, DecodeError};
+use rand::Rng;
 
 /// Webui singleton
 pub static WEBUI: Lazy<Webui> = Lazy::new(Webui::new); 
 
-/// Trait for stable diffusion backends
-#[async_trait]
-pub trait SdApi {    
-    type Txt2ImgReq;
-    type Img2ImgReq;
-    type Txt2ImgResp;
-    type Img2ImgResp;
+pub type ImageVec = Vec<Vec<u8>>;
 
-    async fn txt2img(&self, req: Self::Txt2ImgReq) -> reqwest::Result<Self::Txt2ImgResp>;
-    async fn img2img(&self, req: Self::Img2ImgReq) -> reqwest::Result<Self::Img2ImgResp>;
+/// Backend-agnostic generation request
+/// Generation type based on specified parameters
+#[derive(Clone)]
+pub struct GenerationRequest {
+    pub prompt: String,
+    pub neg_prompt: Option<String>,
+    pub seed: Option<i64>,
+    pub sampler: Option<String>,
+    pub steps: Option<u32>,
+    pub scale: Option<u32>,
+    pub strength: Option<f64>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub batch: Option<u32>,
+    pub no_default_prompt: bool,
+    pub no_default_neg_prompt: bool,
+    pub init_images: Option<ImageVec>,
+}
+
+enum GenerationType {
+    Txt2Img,
+    Img2Img,
+}
+
+impl GenerationRequest {
+    fn get_type(&self) -> GenerationType {
+        match self.init_images {
+            Some(_) => GenerationType::Img2Img,
+            None => GenerationType::Txt2Img
+        }
+    }
+}
+
+#[async_trait]
+pub trait SdApi {
+    // Default values
+    const PROMPT: &'static str;
+    const NEG_PROMPT: &'static str;
+    const SAMPLER: &'static str;
+    const STEPS: u32;
+    const CFG_SCALE: u32;
+    const WIDTH: u32;
+    const HEIGHT: u32;
+    const STRENGTH: f64;
+
+    /// Fill unspecified fields with default parameters
+    fn fill_request(req: &mut GenerationRequest) {
+        // Append default prompt
+        if !req.no_default_prompt {
+            req.prompt.push_str(", ");
+            req.prompt.push_str(Self::PROMPT);
+        }
+
+        // Append default negative prompt
+        if !req.no_default_neg_prompt {
+            if let Some(ref mut neg) = req.neg_prompt {
+                neg.push_str(", ");
+                neg.push_str(Self::NEG_PROMPT);   
+            }
+        }
+
+        // Generate random seed
+        req.seed.get_or_insert(rand::thread_rng().gen());
+        
+        req.neg_prompt.get_or_insert(Self::NEG_PROMPT.to_string());
+        req.sampler.get_or_insert(Self::SAMPLER.to_string());
+        req.steps.get_or_insert(Self::STEPS);
+        req.scale.get_or_insert(Self::CFG_SCALE);
+        req.strength.get_or_insert(Self::STRENGTH);
+        req.width.get_or_insert(Self::WIDTH);
+        req.height.get_or_insert(Self::HEIGHT);
+        req.batch.get_or_insert(1);
+    }
+    
+    /// Generate txt2img or img2img based on request
+    async fn generate(&self, req: GenerationRequest) -> anyhow::Result<(ImageVec, GenerationRequest)>;
+    
+    /// Get progress `(current, full)`
+    async fn progress(&self) -> Option<(u32, u32)>;
+}
+
+#[async_trait]
+impl SdApi for Webui {
+    const PROMPT: &'static str = "masterpiece, best quality";
+    const NEG_PROMPT: &'static str = "(worst quality, low quality:1.4), bad anatomy, hands";
+    const SAMPLER: &'static str = "Euler a";
+    const STEPS: u32 = 28;
+    const CFG_SCALE: u32 = 7;
+    const WIDTH: u32 = 512;
+    const HEIGHT: u32 = 512;
+    const STRENGTH: f64 = 0.75;
+
+    async fn generate(&self, mut req: GenerationRequest) -> anyhow::Result<(ImageVec, GenerationRequest)> {
+        Self::fill_request(&mut req);
+        
+        let builder = match req.get_type() {
+            GenerationType::Txt2Img => self.client.post("http://127.0.0.1:7860/sdapi/v1/txt2img"),
+            GenerationType::Img2Img => self.client.post("http://127.0.0.1:7860/sdapi/v1/img2img"),
+        };
+
+        let out_req = req.clone();
+        let resp = match req.get_type() {
+            GenerationType::Txt2Img => {
+                let req: WebuiRequestTxt2Img = req.into();
+                builder.json(&req)
+            }
+            GenerationType::Img2Img => {
+                let req: WebuiRequestImg2Img = req.into();
+                builder.json(&req)
+            }
+        }
+        .send()
+        .await?;
+
+        match resp.status() {
+            StatusCode::OK => {
+                let resp: WebuiResponse = resp.json().await?;
+                let res: Result<Vec<_>, DecodeError> = resp.images
+                    .into_iter()
+                    .map(|b64| general_purpose::STANDARD.decode(b64))
+                    .collect();
+
+                Ok((res?, out_req))
+            }
+            _ => anyhow::bail!(resp.text().await?)
+        }
+        
+    }
+    
+    async fn progress(&self) -> Option<(u32, u32)> {
+        None
+    }
+}
+
+impl From<GenerationRequest> for WebuiRequestTxt2Img {
+    /// Assume that request fully filled and unwrap it
+    fn from(value: GenerationRequest) -> Self {
+        Self {
+            prompt: value.prompt,
+            seed: value.seed.unwrap(),
+            sampler_name: value.sampler.unwrap(),
+            batch_size: value.batch.unwrap(),
+            steps: value.steps.unwrap(),
+            cfg_scale: value.scale.unwrap(),
+            width: value.width.unwrap(),
+            height: value.height.unwrap(),
+            denoising_strength: value.strength.unwrap(),
+            negative_prompt: value.neg_prompt.unwrap(),
+        }
+    }
+}
+
+impl From<GenerationRequest> for WebuiRequestImg2Img {
+    /// Assume that request filled and has init_images
+    fn from(mut value: GenerationRequest) -> Self {
+        Self {
+            init_images: value.init_images
+                .take()
+                .unwrap()
+                .into_iter()
+                .map(|img|
+                    general_purpose::STANDARD.encode(img.as_slice())
+                )
+                .collect(),
+            txt2img: value.into(),
+        }
+    }
 }
 
 #[derive(Serialize)]
-pub struct WebuiRequestTxt2Img {
+struct WebuiRequestTxt2Img {
     pub prompt: String,
     pub seed: i64,
     pub sampler_name: String,
@@ -33,22 +194,15 @@ pub struct WebuiRequestTxt2Img {
 }
 
 #[derive(Serialize)]
-pub struct WebuiRequestImg2Img {
+struct WebuiRequestImg2Img {
     #[serde(flatten)]
     pub txt2img: WebuiRequestTxt2Img,
     pub init_images: Vec<String>,
 }
 
 #[derive(Deserialize)]
-pub struct WebuiResponse {
+struct WebuiResponse {
     pub images: Vec<String>,
-    pub info: String,
-}
-
-#[derive(Deserialize)]
-pub struct WebuiInfo {
-    // ...
-    pub infotexts: Vec<String>,
 }
 
 pub struct Webui {
@@ -58,50 +212,5 @@ pub struct Webui {
 impl Webui {
     pub fn new() -> Self {
         Self { client: Client::new() }
-    }
-}
-
-impl Default for WebuiRequestTxt2Img {
-    fn default() -> Self {
-        Self {
-            prompt: "masterpiece, best quality,".into(),
-            seed: -1,
-            sampler_name: "Euler a".into(),
-            batch_size: 1,
-            steps: 28,
-            cfg_scale: 7,
-            width: 512,
-            height: 512,
-            denoising_strength: 0.75,
-            negative_prompt: "(worst quality, low quality:1.4), bad anatomy, hands, ".into(),
-        }
-    }
-}
-
-#[async_trait]
-impl SdApi for Webui {
-    type Txt2ImgReq = WebuiRequestTxt2Img;
-    type Img2ImgReq = WebuiRequestImg2Img;
-    type Txt2ImgResp = WebuiResponse;
-    type Img2ImgResp = WebuiResponse;
-
-    async fn txt2img(&self, req: Self::Txt2ImgReq) -> reqwest::Result<Self::Txt2ImgResp> {
-        self.client
-            .post("http://127.0.0.1:7860/sdapi/v1/txt2img")
-            .json(&req)
-            .send()
-            .await?
-            .json()
-            .await
-    }
-
-    async fn img2img(&self, req: Self::Img2ImgReq) -> reqwest::Result<Self::Img2ImgResp> {
-        self.client
-            .post("http://127.0.0.1:7860/sdapi/v1/img2img")
-            .json(&req)
-            .send()
-            .await?
-            .json()
-            .await
     }
 }
