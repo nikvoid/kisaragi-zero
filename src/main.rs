@@ -86,6 +86,10 @@ static CONFIG: Lazy<Config> = Lazy::new(||
     Config::load("config.toml").expect("Failed to load config")
 );
 
+pub fn is_admin(id: u64) -> bool {
+    CONFIG.admins.contains(&id)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()>  {
     tracing_subscriber::fmt::init();

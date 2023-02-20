@@ -13,6 +13,7 @@ pub struct Config {
     pub target_guild: Option<u64>,
     pub prefix: String,
     pub sdapi_backend: SdapiBackend, 
+    pub admins: Vec<u64>,
 }
 
 impl Default for Config {
@@ -23,6 +24,7 @@ impl Default for Config {
             target_guild: Some(0),
             prefix: "$$".into(),
             sdapi_backend: SdapiBackend::Webui,
+            admins: vec![]
         }
     }
 }

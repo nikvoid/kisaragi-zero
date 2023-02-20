@@ -1,11 +1,11 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::{sync::atomic::{AtomicBool, Ordering}, time::Duration};
 
 use once_cell::sync::Lazy;
-use serenity::builder::CreateEmbed;
+use serenity::builder::{CreateEmbed, CreateInteractionResponseFollowup};
 use serenity::model::prelude::Attachment;
-use tokio::sync::mpsc::Sender;
-use tokio::sync::oneshot;
-use crate::sdapi::{GenerationRequest, SdApi, ImageVec};
+use tokio::sync::oneshot::error::TryRecvError;
+use tokio::sync::{watch, oneshot, mpsc};
+use crate::sdapi::{GenerationRequest, SdApi, ImageVec, Progress};
 use super::prelude::*;
 
 /// Wrapper for choosing backend
@@ -17,28 +17,53 @@ macro_rules! sd_generate {
     } 
 }
 
-enum DreamTask {
-    Dream(DreamCommand, oneshot::Sender<anyhow::Result<(ImageVec, GenerationRequest)>>),
+/// Wrapper for choosing backend
+macro_rules! sd_progress {
+    () => { 
+        match $crate::CONFIG.sdapi_backend {
+            $crate::config::SdapiBackend::Webui => $crate::sdapi::WEBUI.progress()
+        }    
+    } 
 }
+
+/// Progress watcher update interval
+const UPDATE_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Is currently generating
 static GENERATING: AtomicBool = AtomicBool::new(false);
 
 /// Dream command executor
-static DREAM_POOL: Lazy<Sender<DreamTask>> = Lazy::new(|| { 
-    let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+static DREAM_POOL: Lazy<mpsc::Sender<DreamTask>> = Lazy::new(|| { 
+    let (tx, mut rx) = mpsc::channel::<DreamTask>(32);
     tokio::spawn(async move { 
+        // Fetch commands
         while let Some(msg) = rx.recv().await {
             // Indicate state
             GENERATING.store(true, Ordering::SeqCst);
-            match msg {
-                DreamTask::Dream(cmd, back_tx) => {
+            // Capture time
+            let start_time = tokio::time::Instant::now();        
+            match msg.kind {
+                DreamType::Dream(cmd) => {
+                    // Spawn watcher task
+                    tokio::spawn(async move {
+                        loop {
+                            if let Ok(progress) = sd_progress!().await {
+                                match msg.progress_tx.send(progress) {
+                                    Ok(_) => tokio::time::sleep(UPDATE_INTERVAL).await,
+                                    Err(_) => break,
+                            }}
+                        }
+                    });
+                    
                     let res = cmd.into_request()
                         .await
                         .map(|req| sd_generate!(req));
                     match res {
-                        Ok(r) => back_tx.send(r.await).ok(),
-                        Err(e) => back_tx.send(Err(e)).ok(),
+                        Ok(r) => {
+                            let res = r.await.map(|r| (r.0, r.1, start_time.elapsed()));
+                            msg.back_tx.send(res).ok()
+                        }
+                        Err(e) => msg.back_tx.send(Err(e)).ok(),
                     };
                 },
             }
@@ -48,11 +73,24 @@ static DREAM_POOL: Lazy<Sender<DreamTask>> = Lazy::new(|| {
     tx
 });
 
+
+type DreamResult = anyhow::Result<(ImageVec, GenerationRequest, Duration)>;
+
+struct DreamTask {
+    back_tx: oneshot::Sender<DreamResult>,
+    progress_tx: watch::Sender<Progress>,
+    kind: DreamType
+}
+
+enum DreamType {
+    Dream(DreamCommand)
+}
+
 /// Request image generation
 #[derive(Command, Clone)]
 #[name = "dream_ng"]
 pub struct DreamCommand {
-    /// Prompt. Quality improving keeeeeee will be prepended
+    /// Prompt. Quality improving keywords will be appended
     prompt: String,
     /// Steps
     #[min = 1]
@@ -97,7 +135,6 @@ pub struct DreamCommand {
     no_default_prompt: Option<bool>,
     /// Do not add default keywords to negative prompt
     no_default_neg_prompt: Option<bool>,
-    // TODO: Restrict this
     /// Count of images to generate. Will be ignored if not from admin
     #[min = 1]
     #[max = 16]
@@ -139,7 +176,63 @@ impl DreamCommand {
             },
         })
     }
+
+    fn create_dream_result<'a, 'b>(
+        &'b self,
+        response: &'b mut CreateInteractionResponseFollowup<'a>,
+        result: &'a DreamResult,
+        command: &ApplicationCommandInteraction,
+    ) -> &mut CreateInteractionResponseFollowup<'a> {
+        match result {
+            Ok((imgs, info, comp_time)) => {
+                let imgs: Vec<_> = imgs
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, img)|
+                        (img, format!("{idx}.png"))
+                    )
+                    .collect();
+                let mut img_iter = imgs.iter();
+                let resp = response                       
+                    .content(&command.user)
+                    .embed(|embed| { 
+                        let mut embed = embed 
+                            .title("Generation result")
+                            .description(format!("Compute used: {:.2} sec", comp_time.as_secs_f32()))
+                            .field("Prompt", &info.prompt, false)                                
+                            .opt_field("Negative prompt", info.neg_prompt.as_ref(), false)
+                            .opt_field("Seed", info.seed, true)
+                            .opt_field("Sampler", info.sampler.as_ref(), true)
+                            .opt_field("Steps", info.steps, true)
+                            .opt_field("Scale", info.scale, true)
+                            .opt_field("Strength", info.strength, true)
+                            .opt_field("Width", info.width, true)
+                            .opt_field("Height", info.height, true)
+                            .attachment("result.png");
+
+                        if let Some(ref att) = self.init_image {
+                            embed = embed.thumbnail(&att.url)
+                        }
+
+                        embed
+                    });
+                    if let Some((first, _)) = img_iter.next() {
+                        resp.add_file((first.as_slice(), "result.png"));
+                    }
+                    resp.add_files(img_iter.map(|(img, name)| (img.as_slice(), name.as_str())))
+            }
+            Err(err) => {
+                response
+                    .content(&command.user)
+                    .embed(|embed| embed
+                        .title("Error generating response")
+                        .description(err)
+                    )
+            }
+        }
+    }
 }
+
 
 #[async_trait]
 impl ApplicationCommandInteractionHandler for DreamCommand {
@@ -148,6 +241,7 @@ impl ApplicationCommandInteractionHandler for DreamCommand {
         ctx: &Context,
         command: &ApplicationCommandInteraction,
     ) -> Result<(), InvocationError> {
+
         // Send queue pos response
         let busy = GENERATING.load(Ordering::Relaxed);
         let queue_pos = DREAM_POOL.max_capacity() - DREAM_POOL.capacity() + busy as usize;
@@ -160,71 +254,73 @@ impl ApplicationCommandInteractionHandler for DreamCommand {
             .await
             .map_err(|_| InvocationError)?;
 
-        // Send command to executor with oneshot channel
-        let (tx, rx) = oneshot::channel();
-        DREAM_POOL.send(DreamTask::Dream(self.clone(), tx))
+        let mut cmd = self.clone();
+
+        // Admin check
+        if !crate::is_admin(command.user.id.0) {
+            cmd.batch_size.replace(1);
+        } 
+        
+        // Send command to executor with oneshot and watcher channel
+        let (tx, mut rx) = oneshot::channel();
+        let (watch_tx, mut watch_rx) = watch::channel((0, 0));
+
+        let task = DreamTask {
+            back_tx: tx,
+            progress_tx: watch_tx,
+            kind: DreamType::Dream(cmd)
+        };
+        
+        DREAM_POOL.send(task)
             .await
             .map_err(|_| InvocationError)?;
 
-        // Capture time
-        let start_time = tokio::time::Instant::now();
+        loop {
+            tokio::select! {
+                biased;
+                Ok(_) = watch_rx.changed() => {
+                    let (step, steps) = *watch_rx.borrow();
+                    let percents = (step as f64 / steps as f64) * 100.;
+                    
+                    let res = command.edit_original_interaction_response(&ctx.http, |response| response
+                        .content(format!(
+                            "Queue position: #{queue_pos}\nStatus: {step}/{steps} | {percents:.2}%"
+                        ))
+                    ).await;
 
-        // Wait on response
-        let result = rx.await.map_err(|_| InvocationError)?;
-        command
-            .create_followup_message(&ctx.http, |response| match &result {
-                Ok((imgs, info)) => {
-                    let comp_time = start_time.elapsed();
-                    let imgs: Vec<_> = imgs
-                        .iter()
-                        .enumerate()
-                        .map(|(idx, img)|
-                            (img, format!("{idx}.png"))
-                        )
-                        .collect();
-                    let mut img_iter = imgs.iter();
-                    let resp = response                       
-                        .content(&command.user)
-                        .embed(|embed| { 
-                            let mut embed = embed 
-                                .title("Generation result")
-                                .description(format!("Compute used: {:.2} sec", comp_time.as_secs_f32()))
-                                .field("Prompt", &info.prompt, false)                                
-                                .opt_field("Negative prompt", info.neg_prompt.as_ref(), false)
-                                .opt_field("Seed", info.seed, true)
-                                .opt_field("Sampler", info.sampler.as_ref(), true)
-                                .opt_field("Steps", info.steps, true)
-                                .opt_field("Scale", info.scale, true)
-                                .opt_field("Strength", info.strength, true)
-                                .opt_field("Width", info.width, true)
-                                .opt_field("Height", info.height, true)
-                                .attachment("result.png");
-
-                            if let Some(ref att) = self.init_image {
-                                embed = embed.thumbnail(&att.url)
-                            }
-
-                            embed
-                        });
-                        if let Some((first, _)) = img_iter.next() {
-                            resp.add_file((first.as_slice(), "result.png"));
+                    if let Err(e) = res {
+                        error!(?e, "failed to edit message");
+                    }
+                },
+                res = async { rx.try_recv() } => { 
+                    match res {
+                        // Generation end, return result
+                        Ok(res) => {
+                            command.create_followup_message(&ctx.http, |response| 
+                                self.create_dream_result(
+                                    response, 
+                                    &res, 
+                                    command
+                            ))
+                            .await
+                            .map_err(|e| {error!(?e, "dream failed"); InvocationError })?;
+                            return Ok(())
                         }
-                        resp.add_files(img_iter.map(|(img, name)| (img.as_slice(), name.as_str())))
-                }
-                Err(err) => {
-                    response
-                        .content(&command.user)
-                        .embed(|embed| embed
-                            .title("Error generating response")
-                            .description(err)
-                        )
-                }
-            })
-            .await
-            .map_err(|e| {error!(?e, "dream failed"); InvocationError })?;
-        Ok(())
+                        // In progress, wait for more
+                        Err(TryRecvError::Empty) => {
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                            continue
+                        }
+                        // Unknown fail
+                        _ => return Err(InvocationError)
+                    }
+                },
+                else => {}   
+            }
+        }
     }
 }
+
 
 trait CreateEmbedExt {
     fn opt_field<T, U>(&mut self, name: T, value: Option<U>, inline: bool) -> &mut Self

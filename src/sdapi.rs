@@ -9,6 +9,7 @@ use rand::Rng;
 pub static WEBUI: Lazy<Webui> = Lazy::new(Webui::new); 
 
 pub type ImageVec = Vec<Vec<u8>>;
+pub type Progress = (u32, u32);
 
 /// Backend-agnostic generation request
 /// Generation type based on specified parameters
@@ -72,7 +73,8 @@ pub trait SdApi {
         }
 
         // Generate random seed
-        req.seed.get_or_insert(rand::thread_rng().gen());
+        let seed: i32 = rand::thread_rng().gen();
+        req.seed.get_or_insert(seed as _);
         
         req.neg_prompt.get_or_insert(Self::NEG_PROMPT.to_string());
         req.sampler.get_or_insert(Self::SAMPLER.to_string());
@@ -88,7 +90,7 @@ pub trait SdApi {
     async fn generate(&self, req: GenerationRequest) -> anyhow::Result<(ImageVec, GenerationRequest)>;
     
     /// Get progress `(current, full)`
-    async fn progress(&self) -> Option<(u32, u32)>;
+    async fn progress(&self) -> anyhow::Result<Progress>;
 }
 
 #[async_trait]
@@ -139,8 +141,14 @@ impl SdApi for Webui {
         
     }
     
-    async fn progress(&self) -> Option<(u32, u32)> {
-        None
+    async fn progress(&self) -> anyhow::Result<Progress> {
+        let resp: WebuiProgress = self.client.get("http://127.0.0.1:7860/sdapi/v1/progress")
+            .send()
+            .await?
+            .json()
+            .await?;
+
+        Ok((resp.state.sampling_step, resp.state.sampling_steps))
     }
 }
 
@@ -203,6 +211,19 @@ struct WebuiRequestImg2Img {
 #[derive(Deserialize)]
 struct WebuiResponse {
     pub images: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct WebuiProgress {
+    progress: f64,
+    eta_relative: f64,
+    state: WebuiProgressState
+}
+
+#[derive(Deserialize)]
+struct WebuiProgressState {
+    sampling_step: u32,
+    sampling_steps: u32,
 }
 
 pub struct Webui {
