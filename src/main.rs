@@ -1,4 +1,6 @@
 #![feature(fs_try_exists)]
+#![feature(try_blocks)]
+#![feature(result_option_inspect)]
 
 use once_cell::sync::Lazy;
 use serenity::{
@@ -22,6 +24,8 @@ use commands::*;
 
 mod config;
 use config::Config;
+
+mod sdapi;
 
 struct Handler;
 
@@ -67,10 +71,14 @@ impl EventHandler for Handler {
     async fn ready(&self, ctx: Context, ready: Ready) {
         info!("{} is connected!", ready.user.name);
 
-        let target = CONFIG.target_guild.map(|id| GuildId(id));
+        let target = CONFIG.target_guild.map(GuildId);
         
-        let commands = register_commands!(&ctx, target, [HelloCommand, RollCommand])
-            .expect("Unable to register commands");
+        let commands = register_commands!(&ctx, target, [
+            HelloCommand,
+            RollCommand,
+            DreamCommand
+        ])
+        .expect("Unable to register commands");
                 
         info!("Registered {} commands", commands.len());
     }

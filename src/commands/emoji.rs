@@ -1,5 +1,3 @@
-use std::path::Path;
-
 use super::prelude::*;
 use serenity::model::prelude::Message;
 use serenity::prelude::SerenityError;
@@ -17,7 +15,7 @@ pub async fn try_send_emoji(
 
     // Prevent path attack
     for c in emo.chars() {
-        if !c.is_ascii_lowercase() && !c.is_digit(10) && c != '_' {
+        if !c.is_ascii_lowercase() && !c.is_ascii_digit() && c != '_' {
             return None;
         }
     }
@@ -42,7 +40,7 @@ pub async fn try_send_emoji(
     let res = msg.channel_id.send_message(&ctx.http, |msg| msg
         .embed(|embed| embed
             .title(format!("{author}:"))                                
-            .image(format!("attachment://emo.png"))
+            .attachment("emo.png")
         )
         .add_file((&emoji, "emo.png"))
     ).await;

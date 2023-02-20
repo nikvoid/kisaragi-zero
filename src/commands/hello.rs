@@ -19,8 +19,7 @@ impl ApplicationCommandInteractionHandler for HelloCommand {
             .user
             .member
             .as_ref()
-            .map(|pm| pm.nick.as_ref())
-            .flatten();
+            .and_then(|pm| pm.nick.as_ref());
         let greeting = if let Some(nick) = nickname {
             format!("Hello {} aka {}", self.user.user.name, nick)
         } else {
