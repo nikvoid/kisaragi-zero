@@ -32,7 +32,7 @@ mod dream;
 
 pub use hello::HelloCommand;
 pub use roll::RollCommand;
-pub use dream::DreamCommand;
+pub use dream::{DreamCommand, DreamMatrixCommand};
 pub use emoji::{try_send_emoji, send_emoji_list};
 
 #[derive(slashies_macros::Commands)]
@@ -40,4 +40,5 @@ pub enum BotCommands {
     Hello(HelloCommand),
     Roll(RollCommand),
     Dream(DreamCommand),
+    DreamMatrix(DreamMatrixCommand)
 }

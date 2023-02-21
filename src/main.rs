@@ -1,4 +1,5 @@
 #![feature(fs_try_exists)]
+#![feature(try_blocks)]
 
 use once_cell::sync::Lazy;
 use serenity::{
@@ -74,7 +75,8 @@ impl EventHandler for Handler {
         let commands = register_commands!(&ctx, target, [
             HelloCommand,
             RollCommand,
-            DreamCommand
+            DreamCommand,
+            DreamMatrixCommand
         ])
         .expect("Unable to register commands");
                 
