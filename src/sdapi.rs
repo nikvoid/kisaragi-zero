@@ -1,12 +1,19 @@
+use std::{time::Duration, io::Cursor};
+
+use image::{imageops::FilterType, ImageFormat};
 use once_cell::sync::Lazy;
 use serde::{Serialize, Deserialize};
 use serenity::async_trait;
 use reqwest::{Client, StatusCode};
 use base64::{Engine, engine::general_purpose, DecodeError};
 use rand::Rng;
+use tokio::sync::RwLock;
 
 /// Webui singleton
-pub static WEBUI: Lazy<Webui> = Lazy::new(Webui::new); 
+pub static WEBUI: Lazy<Webui> = Lazy::new(|| Webui { client: Client::new() }); 
+
+/// Mock api singleton
+pub static MOCK_API: Lazy<MockSdApi> = Lazy::new(|| MockSdApi { progress: RwLock::new((0, 0)) });
 
 pub type ImageVec = Vec<Vec<u8>>;
 pub type Progress = (u32, u32);
@@ -152,6 +159,40 @@ impl SdApi for Webui {
     }
 }
 
+#[async_trait]
+impl SdApi for MockSdApi {
+    const PROMPT: &'static str = "masterpiece, best quality";
+    const NEG_PROMPT: &'static str = "(worst quality, low quality:1.4), bad anatomy, hands";
+    const SAMPLER: &'static str = "Euler a";
+    const STEPS: u32 = 28;
+    const CFG_SCALE: u32 = 7;
+    const WIDTH: u32 = 512;
+    const HEIGHT: u32 = 512;
+    const STRENGTH: f64 = 0.75;
+    
+    async fn generate(&self, mut req: GenerationRequest) -> anyhow::Result<(ImageVec, GenerationRequest)> {
+        Self::fill_request(&mut req);
+        let steps = req.steps.unwrap();
+        self.progress.write().await.1 = steps;
+        for step in 0..steps {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            self.progress.write().await.0 = step;
+        }
+        *self.progress.write().await = (0, 0);
+        
+        let img = image::open("hanyuu.png")?
+            .resize_exact(req.width.unwrap(), req.height.unwrap(), FilterType::Triangle);
+        
+        let mut out = Cursor::new(vec![]);
+        img.write_to(&mut out, ImageFormat::Png)?;
+        Ok((vec![out.into_inner().clone(); req.batch.unwrap() as usize], req))
+    }
+    
+    async fn progress(&self) -> anyhow::Result<Progress> {
+        return Ok(*self.progress.read().await)
+    }
+}
+
 impl From<GenerationRequest> for WebuiRequestTxt2Img {
     /// Assume that request fully filled and unwrap it
     fn from(value: GenerationRequest) -> Self {
@@ -226,12 +267,12 @@ struct WebuiProgressState {
     sampling_steps: u32,
 }
 
+/// https://github.com/AUTOMATIC1111/stable-diffusion-webui
 pub struct Webui {
     client: Client
 }
 
-impl Webui {
-    pub fn new() -> Self {
-        Self { client: Client::new() }
-    }
+/// Api used for testing bot
+pub struct MockSdApi {
+    progress: RwLock<Progress>
 }

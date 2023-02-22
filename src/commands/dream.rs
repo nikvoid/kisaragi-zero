@@ -1,12 +1,11 @@
 use std::{sync::atomic::{AtomicBool, Ordering}, time::Duration, str::FromStr, io::Cursor};
 
-use anyhow::anyhow;
-use image::{RgbImage, codecs::png::{PngDecoder, PngReader}, ImageFormat, imageops::FilterType};
+use image::{RgbImage, ImageFormat, imageops::FilterType};
 use once_cell::sync::Lazy;
 use serenity::builder::{CreateEmbed, CreateInteractionResponseFollowup};
 use serenity::model::prelude::Attachment;
-use tokio::{sync::oneshot::error::TryRecvError, task::spawn_blocking};
-use tokio::sync::{watch, oneshot, mpsc};
+use tokio::task::spawn_blocking;
+use tokio::sync::{watch, mpsc};
 use crate::sdapi::{GenerationRequest, SdApi, ImageVec, Progress};
 use super::prelude::*;
 
@@ -14,7 +13,8 @@ use super::prelude::*;
 macro_rules! sd_generate {
     ($req:expr) => { 
         match $crate::CONFIG.sdapi_backend {
-            $crate::config::SdapiBackend::Webui => $crate::sdapi::WEBUI.generate($req)
+            $crate::config::SdapiBackend::Webui => $crate::sdapi::WEBUI.generate($req),
+            $crate::config::SdapiBackend::Mock => $crate::sdapi::MOCK_API.generate($req)
         }    
     } 
 }
@@ -23,7 +23,8 @@ macro_rules! sd_generate {
 macro_rules! sd_progress {
     () => { 
         match $crate::CONFIG.sdapi_backend {
-            $crate::config::SdapiBackend::Webui => $crate::sdapi::WEBUI.progress()
+            $crate::config::SdapiBackend::Webui => $crate::sdapi::WEBUI.progress(),
+            $crate::config::SdapiBackend::Mock => $crate::sdapi::MOCK_API.progress()
         }    
     } 
 }
@@ -32,7 +33,8 @@ macro_rules! sd_progress {
 macro_rules! sd_fill {
     ($req:expr) => {
         match $crate::CONFIG.sdapi_backend {
-            $crate::config::SdapiBackend::Webui => $crate::sdapi::Webui::fill_request($req)
+            $crate::config::SdapiBackend::Webui => $crate::sdapi::Webui::fill_request($req),
+            $crate::config::SdapiBackend::Mock => $crate::sdapi::MockSdApi::fill_request($req)
         }    
     }
 }
@@ -56,13 +58,14 @@ static DREAM_POOL: Lazy<mpsc::Sender<DreamTask>> = Lazy::new(|| {
             GENERATING.store(true, Ordering::SeqCst);
             // Capture time
             let start_time = tokio::time::Instant::now();        
+            let progress_tx = msg.back_tx.clone();
             match msg.kind {
                 DreamType::Dream(cmd) => {
                     // Spawn watcher task
                     tokio::spawn(async move {
                         loop {
                             if let Ok(progress) = sd_progress!().await {
-                                match msg.progress_tx.send((progress, (0, 1))) {
+                                match progress_tx.send(DreamOutput::Progress(progress, (0, 1))).await {
                                     Ok(_) => tokio::time::sleep(UPDATE_INTERVAL).await,
                                     Err(_) => break,
                             }}
@@ -75,14 +78,15 @@ static DREAM_POOL: Lazy<mpsc::Sender<DreamTask>> = Lazy::new(|| {
                     match res {
                         Ok(r) => {
                             let res = r.await.map(|r| (r.0, r.1, start_time.elapsed()));
-                            msg.back_tx.send(res).ok()
+                            msg.back_tx.send(DreamOutput::Result(res)).await.ok()
                         }
-                        Err(e) => msg.back_tx.send(Err(e)).ok(),
+                        Err(e) => msg.back_tx.send(DreamOutput::Result(Err(e))).await.ok(),
                     };
                 }
 
                 DreamType::Matrix(cmd) => {
                     // Parse matrix
+                    // TODO: Factor this to separate function(s)
                     let result: DreamResult = try {
                         let matrix = MatrixSize::from_str(&cmd.matrix_size)?;
 
@@ -93,9 +97,18 @@ static DREAM_POOL: Lazy<mpsc::Sender<DreamTask>> = Lazy::new(|| {
                             loop {
                                 // FIXME: Implement overall steps report
                                 // Idea: calculate base from processed img count, add received to result
-                                if let Ok(progress) = sd_progress!().await {
-                                    let report = (progress, (*curr_img_watch.borrow(), images));
-                                    match msg.progress_tx.send(report) {
+                                // Buuuuut... Requested steps aren't always correspond to real...
+                                if let Ok((cur_steps, _)) = sd_progress!().await {
+                                    let processed_imgs = *curr_img_watch.borrow();
+                                    // We can fold matrix iterator to find overall steps count
+                                    let steps_made = cur_steps + matrix.iter()
+                                        .take(processed_imgs)
+                                        .map(|(_, steps)| steps)
+                                        .sum::<u32>(); 
+                                    let steps_progress = (steps_made, matrix.overall_steps());
+                                    let imgs_progress = (processed_imgs as u32, images);
+                                    let report = DreamOutput::Progress(steps_progress, imgs_progress);
+                                    match progress_tx.send(report).await {
                                         Ok(_) => tokio::time::sleep(UPDATE_INTERVAL).await,
                                         Err(_) => break,
                                 }}
@@ -147,7 +160,7 @@ static DREAM_POOL: Lazy<mpsc::Sender<DreamTask>> = Lazy::new(|| {
                         (vec![out.into_inner()], req, start_time.elapsed())
                     };
 
-                    msg.back_tx.send(result).ok();                  
+                    msg.back_tx.send(DreamOutput::Result(result)).await.ok();                  
                 }
             }
             GENERATING.store(false, Ordering::SeqCst);
@@ -164,18 +177,20 @@ fn get_queue_size() -> usize {
 
 type DreamResult = anyhow::Result<(ImageVec, GenerationRequest, Duration)>;
 
-/// Current image, all images
-type ProgressImages = (Progress, Progress);
-
 struct DreamTask {
-    back_tx: oneshot::Sender<DreamResult>,
-    progress_tx: watch::Sender<ProgressImages>,
+    back_tx: mpsc::Sender<DreamOutput>,
     kind: DreamType
 }
 
 enum DreamType {
     Dream(DreamCommand),
     Matrix(DreamMatrixCommand),
+}
+
+enum DreamOutput {
+    Result(DreamResult),
+    /// Steps, images
+    Progress(Progress, Progress),
 }
 
 #[derive(Clone, Copy)]
@@ -397,12 +412,9 @@ impl ApplicationCommandInteractionHandler for DreamMatrixCommand {
         let cmd = self.clone();
 
         // Send command to executor with oneshot and watcher channel
-        let (tx, mut rx) = oneshot::channel();
-        let (watch_tx, mut watch_rx) = watch::channel(((0, 0), (0, 0)));
-
+        let (tx, mut rx) = mpsc::channel(4);
         let task = DreamTask {
             back_tx: tx,
-            progress_tx: watch_tx,
             kind: DreamType::Matrix(cmd)
         };
 
@@ -412,11 +424,9 @@ impl ApplicationCommandInteractionHandler for DreamMatrixCommand {
             .await
             .map_err(|_| InvocationError)?;
 
-        loop {
-            tokio::select! {
-                biased;
-                Ok(_) = watch_rx.changed() => {
-                    let ((step, steps), (img, imgs)) = *watch_rx.borrow();
+        while let Some(msg) = rx.recv().await {
+            match msg {
+                DreamOutput::Progress((step, steps), (img, imgs)) => {
                     let percents = (step as f64 / steps as f64) * 100.;
                     
                     let res = command.edit_original_interaction_response(&ctx.http, |response| response
@@ -436,43 +446,31 @@ impl ApplicationCommandInteractionHandler for DreamMatrixCommand {
                     if let Err(e) = res {
                         error!(?e, "failed to edit message");
                     }
-                },
-                res = async { rx.try_recv() } => { 
-                    match res {
-                        // Generation end, return result
-                        Ok(mut res) => {
-                            command.create_followup_message(&ctx.http, |response| {
-                                if let Ok((_, ref mut info, _)) = res {
-                                    info.steps = None;
-                                    info.strength = None;
-                                }
-                                create_dream_result(
-                                    &self.init_image,
-                                    response, 
-                                    &res, 
-                                    command);
+                }
+                DreamOutput::Result(mut res) => {
+                    command.create_followup_message(&ctx.http, |response| {
+                        if let Ok((_, ref mut info, _)) = res {
+                            info.steps = None;
+                            info.strength = None;
+                        }
+                        create_dream_result(
+                            &self.init_image,
+                            response, 
+                            &res, 
+                            command);
 
-                                response.embed(|embed| embed
-                                    .title("========= Matrix Parameters =========")
-                                    .description(matrix.table())
-                                )
-                            })
-                            .await
-                            .map_err(|e| {error!(?e, "matrix failed"); InvocationError })?;
-                            return Ok(())
-                        }
-                        // In progress, wait for more
-                        Err(TryRecvError::Empty) => {
-                            tokio::time::sleep(Duration::from_millis(20)).await;
-                            continue
-                        }
-                        // Unknown fail
-                        _ => return Err(InvocationError)
-                    }
-                },
-                else => {}   
+                        response.embed(|embed| embed
+                            .title("========= Matrix Parameters =========")
+                            .description(matrix.table())
+                        )
+                    })
+                    .await
+                    .map_err(|e| {error!(?e, "matrix failed"); InvocationError })?;
+                    return Ok(())
+                }                
             }
         }
+        Err(InvocationError)
     }
 }
 
@@ -598,12 +596,10 @@ impl ApplicationCommandInteractionHandler for DreamCommand {
         } 
         
         // Send command to executor with oneshot and watcher channel
-        let (tx, mut rx) = oneshot::channel();
-        let (watch_tx, mut watch_rx) = watch::channel(((0, 0), (0, 0)));
+        let (tx, mut rx) = mpsc::channel(4);
 
         let task = DreamTask {
             back_tx: tx,
-            progress_tx: watch_tx,
             kind: DreamType::Dream(cmd)
         };
         
@@ -611,12 +607,9 @@ impl ApplicationCommandInteractionHandler for DreamCommand {
             .await
             .map_err(|_| InvocationError)?;
 
-        loop {
-            tokio::select! {
-                biased;
-                Ok(_) = watch_rx.changed() => {
-                    // TODO: Process multiple batch case
-                    let ((step, steps), _) = *watch_rx.borrow();
+        while let Some(msg) = rx.recv().await {
+            match msg {
+                DreamOutput::Progress((step, steps), _) => { 
                     let percents = (step as f64 / steps as f64) * 100.;
                     
                     let res = command.edit_original_interaction_response(&ctx.http, |response| response
@@ -627,35 +620,23 @@ impl ApplicationCommandInteractionHandler for DreamCommand {
 
                     if let Err(e) = res {
                         error!(?e, "failed to edit message");
-                    }
-                },
-                res = async { rx.try_recv() } => { 
-                    match res {
-                        // Generation end, return result
-                        Ok(res) => {
-                            command.create_followup_message(&ctx.http, |response| 
-                                create_dream_result(
-                                    &self.init_image,
-                                    response, 
-                                    &res, 
-                                    command
-                            ))
-                            .await
-                            .map_err(|e| {error!(?e, "dream failed"); InvocationError })?;
-                            return Ok(())
-                        }
-                        // In progress, wait for more
-                        Err(TryRecvError::Empty) => {
-                            tokio::time::sleep(Duration::from_millis(20)).await;
-                            continue
-                        }
-                        // Unknown fail
-                        _ => return Err(InvocationError)
-                    }
-                },
-                else => {}   
+                    } 
+                }
+                DreamOutput::Result(res) => {
+                    command.create_followup_message(&ctx.http, |response| 
+                        create_dream_result(
+                            &self.init_image,
+                            response, 
+                            &res, 
+                            command
+                    ))
+                    .await
+                    .map_err(|e| {error!(?e, "dream failed"); InvocationError })?;
+                    return Ok(()) 
+                }
             }
         }
+        Err(InvocationError)
     }
 }
 
