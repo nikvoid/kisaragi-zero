@@ -1,6 +1,7 @@
 use std::{sync::atomic::{AtomicBool, Ordering}, time::Duration, str::FromStr, io::Cursor};
 
 use image::{RgbImage, ImageFormat, imageops::FilterType, Rgb};
+use imageproc::drawing;
 use once_cell::sync::Lazy;
 use rusttype::{Font, Scale};
 use serenity::builder::{CreateEmbed, CreateInteractionResponseFollowup};
@@ -76,14 +77,20 @@ fn get_queue_size() -> usize {
 }
 
 /// Generate matrix of images. Periodically sends back progress
+///
+/// Feature: if `init_image` is `None`, in output matrix rows will be different 
+/// CFG Scale instead of Strength
 async fn generate_matrix(
     cmd: DreamMatrixCommand, 
     progress_tx: mpsc::Sender<DreamOutput>
 ) -> DreamResult {
     // consts
-    const FONT_SCALE: Scale = Scale { x: 24., y: 24. };
+    const FONT_SCALE: Scale = Scale { x: 64., y: 64. };
     const PADDING: u32 = 5;
-    const SCALING_COEF: f64 = 0.7;
+    const UL_MARGIN: u32 = 120;
+    const DEF_SCALING_COEF: f64 = 1.;
+    /// Discord limit
+    const MAX_PNG_SIZE: u64 = 8_388_284; 
 
     // Parse matrix size
     let matrix = MatrixSize::from_str(&cmd.matrix_size)?;
@@ -119,16 +126,17 @@ async fn generate_matrix(
     let img_h = req.height.unwrap();
     let img_w = req.width.unwrap();
     let buf_h = 
-        img_h * matrix.height()
+        UL_MARGIN + img_h * matrix.height()
          + PADDING * 2 * matrix.height();
     let buf_w = 
-        img_w * matrix.width()
+        UL_MARGIN + img_w * matrix.width()
         + PADDING * 2 * matrix.width();
 
     let mut buff = RgbImage::new(buf_w, buf_h);
 
     let start_time = tokio::time::Instant::now();        
-    // Process matrix
+    
+    // Process matrix, compose images
     for ((strength, steps), (y, x)) in matrix.iter().zip(matrix.iter_yx()) {
         let mut req = req.clone();
         req.steps = Some(steps);
@@ -141,41 +149,66 @@ async fn generate_matrix(
                 .map(|img| img.into_rgb8())                           
         }).await??;
 
-        let x_offset = PADDING + (img_w + PADDING * 2) * x;
-        let y_offset = PADDING + (img_h + PADDING * 2) * y;
+        let x_offset = UL_MARGIN + PADDING + (img_w + PADDING * 2) * x;
+        let y_offset = UL_MARGIN + PADDING + (img_h + PADDING * 2) * y;
     
         image::imageops::overlay(&mut buff, &img, x_offset as i64, y_offset as i64);
-        let mut draw_text = |x, y, text: String| imageproc::drawing::draw_text_mut(
-            &mut buff, 
-            Rgb([0x0, 0x0, 0x0]),
-            x,
-            y,
-            FONT_SCALE,
-            &FONT,
-            &text
-        );
-
-        draw_text(
-            (x_offset + PADDING) as i32,
-            (y_offset + PADDING) as i32,
-            format!("Steps: {steps}")
-        );
-
-        draw_text(
-            (x_offset + PADDING) as i32,
-            (y_offset + PADDING + FONT_SCALE.y as u32) as i32,
-            format!("Strength: {strength:.2}")
-        );
-
         curr_img_sendr.send_modify(|img| *img += 1);
     }
-    let buff = image::imageops::resize(
-        &buff,
-        (buf_w as f64 * SCALING_COEF) as u32, 
-        (buf_h as f64 * SCALING_COEF) as u32, 
-        FilterType::Lanczos3);
+
+    let mut draw_text = |x, y, text: String| imageproc::drawing::draw_text_mut(
+        &mut buff, 
+        Rgb([0xFF, 0xFF, 0xFF]),
+        x,
+        y,
+        FONT_SCALE,
+        &FONT,
+        &text
+    );
+
+    // Draw steps
+    for (x, steps) in matrix.steps().iter().enumerate() {
+        let col_offset = UL_MARGIN + PADDING + (img_w + PADDING * 2) * x as u32;
+
+        let label = format!("{steps}");
+        let (text_w, text_h) = drawing::text_size(FONT_SCALE, &FONT, &label);
+
+        let x_off = (img_w - text_w as u32) / 2 + col_offset;
+        let y_off = (UL_MARGIN - text_h as u32) / 2;
+
+        draw_text(x_off as i32, y_off as i32, label);
+    } 
+    
+    // Draw strengths
+    for (y, strength) in matrix.strengths().iter().enumerate() {
+        let row_offset = UL_MARGIN + PADDING + (img_h + PADDING * 2) * y as u32;
+
+        let label = format!("{strength:.2}");
+        let (text_w, text_h) = drawing::text_size(FONT_SCALE, &FONT, &label);
+
+        let y_off = (img_h - text_h as u32) / 2 + row_offset;
+        let x_off = (UL_MARGIN - text_w as u32) / 2;
+        draw_text(x_off as i32, y_off as i32, label);
+    } 
+
+    // Try to make image smaller while it not fits into discord restriction
+    let mut scale_coef = DEF_SCALING_COEF;
     let mut out = Cursor::new(vec![]);
-    buff.write_to(&mut out, ImageFormat::Png)?;
+    while out.position() == 0 || out.position() >= MAX_PNG_SIZE {
+        out = Cursor::new({ 
+            let mut buf = out.into_inner();
+            buf.clear();
+            buf
+        });
+
+        let buff = image::imageops::resize(
+            &buff,
+            (buf_w as f64 * scale_coef) as u32, 
+            (buf_h as f64 * scale_coef) as u32, 
+            FilterType::Lanczos3);
+        buff.write_to(&mut out, ImageFormat::Png)?;
+        scale_coef -= 0.1;
+    } 
 
     Ok((vec![out.into_inner()], req, start_time.elapsed()))
 }
@@ -224,6 +257,16 @@ impl MatrixSize {
             Self::M3x3 => &[0.35, 0.50, 0.75],
             Self::M5x5 => &[0.35, 0.45, 0.55, 0.65, 0.75],
             Self::M5x7 => &[0.35, 0.40, 0.45, 0.55, 0.60, 0.70, 0.80],
+        }
+    }
+
+    /// Ad-hoc alternative mode of generation - CFG scales (y)
+    fn cfg_scales(self) -> &'static [f64] {
+        match self {
+            Self::M2x2 => &[7., 9.],
+            Self::M3x3 => &[6., 7., 9.],
+            Self::M5x5 => &[6., 7., 9., 12., 15.],
+            Self::M5x7 => &[5., 6., 7., 9., 12., 15., 18.],
         }
     }
 
@@ -682,6 +725,7 @@ fn create_dream_result<'a, 'b>(
                     embed
                 });
 
+            // add file to embed or send separated
             if imgs.len() == 1 {
                 response.add_file((imgs[0].0.as_slice(), "result.png"))
             } else {
