@@ -1,52 +1,26 @@
 use std::{sync::atomic::{AtomicBool, Ordering}, time::Duration, str::FromStr, io::Cursor};
 
-use image::{RgbImage, ImageFormat, imageops::FilterType};
+use image::{RgbImage, ImageFormat, imageops::FilterType, Rgb};
 use once_cell::sync::Lazy;
+use rusttype::{Font, Scale};
 use serenity::builder::{CreateEmbed, CreateInteractionResponseFollowup};
 use serenity::model::prelude::Attachment;
 use tokio::task::spawn_blocking;
 use tokio::sync::{watch, mpsc};
-use crate::sdapi::{GenerationRequest, SdApi, ImageVec, Progress};
+use crate::{sd_fill, sd_generate, sd_progress};
+use crate::sdapi::{GenerationRequest, ImageVec, Progress};
 use super::prelude::*;
-
-/// Wrapper for choosing backend
-macro_rules! sd_generate {
-    ($req:expr) => { 
-        match $crate::CONFIG.sdapi_backend {
-            $crate::config::SdapiBackend::Webui => $crate::sdapi::WEBUI.generate($req),
-            $crate::config::SdapiBackend::Mock => $crate::sdapi::MOCK_API.generate($req)
-        }    
-    } 
-}
-
-/// Wrapper for choosing backend
-macro_rules! sd_progress {
-    () => { 
-        match $crate::CONFIG.sdapi_backend {
-            $crate::config::SdapiBackend::Webui => $crate::sdapi::WEBUI.progress(),
-            $crate::config::SdapiBackend::Mock => $crate::sdapi::MOCK_API.progress()
-        }    
-    } 
-}
-
-/// Wrapper for choosing backend
-macro_rules! sd_fill {
-    ($req:expr) => {
-        match $crate::CONFIG.sdapi_backend {
-            $crate::config::SdapiBackend::Webui => $crate::sdapi::Webui::fill_request($req),
-            $crate::config::SdapiBackend::Mock => $crate::sdapi::MockSdApi::fill_request($req)
-        }    
-    }
-}
-
-const PADDING: u32 = 5;
-const SCALING_COEF: f64 = 0.7;
 
 /// Progress watcher update interval
 const UPDATE_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Is currently generating
 static GENERATING: AtomicBool = AtomicBool::new(false);
+
+/// Font used to draw matrix parameters
+static FONT: Lazy<Font<'static>> = Lazy::new(|| 
+    Font::try_from_bytes(include_bytes!("../../res/nunito.ttf")).expect("Failed to load font")
+); 
 
 /// Dream command executor
 static DREAM_POOL: Lazy<mpsc::Sender<DreamTask>> = Lazy::new(|| { 
@@ -57,7 +31,6 @@ static DREAM_POOL: Lazy<mpsc::Sender<DreamTask>> = Lazy::new(|| {
             // Indicate state
             GENERATING.store(true, Ordering::SeqCst);
             // Capture time
-            let start_time = tokio::time::Instant::now();        
             let progress_tx = msg.back_tx.clone();
             match msg.kind {
                 DreamType::Dream(cmd) => {
@@ -71,7 +44,9 @@ static DREAM_POOL: Lazy<mpsc::Sender<DreamTask>> = Lazy::new(|| {
                             }}
                         }
                     });
-                    
+
+                    let start_time = tokio::time::Instant::now();        
+       
                     let res = cmd.into_request()
                         .await
                         .map(|req| sd_generate!(req));
@@ -85,81 +60,7 @@ static DREAM_POOL: Lazy<mpsc::Sender<DreamTask>> = Lazy::new(|| {
                 }
 
                 DreamType::Matrix(cmd) => {
-                    // Parse matrix
-                    // TODO: Factor this to separate function(s)
-                    let result: DreamResult = try {
-                        let matrix = MatrixSize::from_str(&cmd.matrix_size)?;
-
-                        // Spawn watcher task
-                        let (curr_img_sendr, curr_img_watch) = watch::channel(0);
-                        let images = matrix.area();
-                        tokio::spawn(async move {
-                            loop {
-                                // FIXME: Implement overall steps report
-                                // Idea: calculate base from processed img count, add received to result
-                                // Buuuuut... Requested steps aren't always correspond to real...
-                                if let Ok((cur_steps, _)) = sd_progress!().await {
-                                    let processed_imgs = *curr_img_watch.borrow();
-                                    // We can fold matrix iterator to find overall steps count
-                                    let steps_made = cur_steps + matrix.iter()
-                                        .take(processed_imgs)
-                                        .map(|(_, steps)| steps)
-                                        .sum::<u32>(); 
-                                    let steps_progress = (steps_made, matrix.overall_steps());
-                                    let imgs_progress = (processed_imgs as u32, images);
-                                    let report = DreamOutput::Progress(steps_progress, imgs_progress);
-                                    match progress_tx.send(report).await {
-                                        Ok(_) => tokio::time::sleep(UPDATE_INTERVAL).await,
-                                        Err(_) => break,
-                                }}
-                            }
-                        });
-
-                        let mut req = cmd.into_request().await?;
-                        sd_fill!(&mut req);
-
-                        let img_h = req.height.unwrap();
-                        let img_w = req.width.unwrap();
-                        let buf_h = 
-                            img_h * matrix.height()
-                             + PADDING * 2 * matrix.height();
-                        let buf_w = 
-                            img_w * matrix.width()
-                            + PADDING * 2 * matrix.width();
-
-                        let mut buff = RgbImage::new(buf_w, buf_h);
-
-                        // Process matrix
-                        for ((strength, steps), (y, x)) in matrix.iter().zip(matrix.iter_yx()) {
-                            let mut req = req.clone();
-                            req.steps = Some(steps);
-                            req.strength = Some(strength);
-                            let png = sd_generate!(req).await?;
-                            let img = spawn_blocking(move || {
-                                let mut reader = image::io::Reader::new(Cursor::new(&png.0[0]));
-                                reader.set_format(ImageFormat::Png);
-                                reader.decode()
-                                    .map(|img| img.into_rgb8())                           
-                            }).await??;
-
-                            let x_offset = PADDING + (img_w + PADDING) * x;
-                            let y_offset = PADDING + (img_h + PADDING) * y;
-                        
-                            image::imageops::overlay(&mut buff, &img, x_offset as i64, y_offset as i64);
-
-                            curr_img_sendr.send_modify(|img| *img += 1);
-                        }
-                        let buff = image::imageops::resize(
-                            &buff,
-                            (buf_w as f64 * SCALING_COEF) as u32, 
-                            (buf_h as f64 * SCALING_COEF) as u32, 
-                            FilterType::Lanczos3);
-                        let mut out = Cursor::new(vec![]);
-                        buff.write_to(&mut out, ImageFormat::Png)?;
-
-                        (vec![out.into_inner()], req, start_time.elapsed())
-                    };
-
+                    let result = generate_matrix(cmd, progress_tx).await;
                     msg.back_tx.send(DreamOutput::Result(result)).await.ok();                  
                 }
             }
@@ -174,6 +75,110 @@ fn get_queue_size() -> usize {
     DREAM_POOL.max_capacity() - DREAM_POOL.capacity() + busy as usize
 }
 
+/// Generate matrix of images. Periodically sends back progress
+async fn generate_matrix(
+    cmd: DreamMatrixCommand, 
+    progress_tx: mpsc::Sender<DreamOutput>
+) -> DreamResult {
+    // consts
+    const FONT_SCALE: Scale = Scale { x: 24., y: 24. };
+    const PADDING: u32 = 5;
+    const SCALING_COEF: f64 = 0.7;
+
+    // Parse matrix size
+    let matrix = MatrixSize::from_str(&cmd.matrix_size)?;
+
+    // Spawn watcher task
+    let (curr_img_sendr, curr_img_watch) = watch::channel(0);
+    let images = matrix.area();
+    tokio::spawn(async move {
+        loop {
+            // FIXME: Implement overall steps report
+            // Idea: calculate base from processed img count, add received to result
+            // Buuuuut... Requested steps aren't always correspond to real...
+            if let Ok((cur_steps, _)) = sd_progress!().await {
+                let processed_imgs = *curr_img_watch.borrow();
+                // We can fold matrix iterator to find overall steps count
+                let steps_made = cur_steps + matrix.iter()
+                    .take(processed_imgs)
+                    .map(|(_, steps)| steps)
+                    .sum::<u32>(); 
+                let steps_progress = (steps_made, matrix.overall_steps());
+                let imgs_progress = (processed_imgs as u32, images);
+                let report = DreamOutput::Progress(steps_progress, imgs_progress);
+                match progress_tx.send(report).await {
+                    Ok(_) => tokio::time::sleep(UPDATE_INTERVAL).await,
+                    Err(_) => break,
+            }}
+        }
+    });
+
+    let mut req = cmd.into_request().await?;
+    sd_fill!(&mut req);
+
+    let img_h = req.height.unwrap();
+    let img_w = req.width.unwrap();
+    let buf_h = 
+        img_h * matrix.height()
+         + PADDING * 2 * matrix.height();
+    let buf_w = 
+        img_w * matrix.width()
+        + PADDING * 2 * matrix.width();
+
+    let mut buff = RgbImage::new(buf_w, buf_h);
+
+    let start_time = tokio::time::Instant::now();        
+    // Process matrix
+    for ((strength, steps), (y, x)) in matrix.iter().zip(matrix.iter_yx()) {
+        let mut req = req.clone();
+        req.steps = Some(steps);
+        req.strength = Some(strength);
+        let png = sd_generate!(req).await?;
+        let img = spawn_blocking(move || {
+            let mut reader = image::io::Reader::new(Cursor::new(&png.0[0]));
+            reader.set_format(ImageFormat::Png);
+            reader.decode()
+                .map(|img| img.into_rgb8())                           
+        }).await??;
+
+        let x_offset = PADDING + (img_w + PADDING * 2) * x;
+        let y_offset = PADDING + (img_h + PADDING * 2) * y;
+    
+        image::imageops::overlay(&mut buff, &img, x_offset as i64, y_offset as i64);
+        let mut draw_text = |x, y, text: String| imageproc::drawing::draw_text_mut(
+            &mut buff, 
+            Rgb([0x0, 0x0, 0x0]),
+            x,
+            y,
+            FONT_SCALE,
+            &FONT,
+            &text
+        );
+
+        draw_text(
+            (x_offset + PADDING) as i32,
+            (y_offset + PADDING) as i32,
+            format!("Steps: {steps}")
+        );
+
+        draw_text(
+            (x_offset + PADDING) as i32,
+            (y_offset + PADDING + FONT_SCALE.y as u32) as i32,
+            format!("Strength: {strength:.2}")
+        );
+
+        curr_img_sendr.send_modify(|img| *img += 1);
+    }
+    let buff = image::imageops::resize(
+        &buff,
+        (buf_w as f64 * SCALING_COEF) as u32, 
+        (buf_h as f64 * SCALING_COEF) as u32, 
+        FilterType::Lanczos3);
+    let mut out = Cursor::new(vec![]);
+    buff.write_to(&mut out, ImageFormat::Png)?;
+
+    Ok((vec![out.into_inner()], req, start_time.elapsed()))
+}
 
 type DreamResult = anyhow::Result<(ImageVec, GenerationRequest, Duration)>;
 
@@ -259,24 +264,6 @@ impl MatrixSize {
     /// Matrix area
     fn area(self) -> u32 {
         self.width() * self.height()
-    }
-
-    /// Print table with matrix parameters
-    fn table(self) -> String {
-        const COL_W: usize = 4;
-        let mut out = String::from("steps (x):  ");
-
-        for steps in self.steps() {
-            out.push_str(&format!("{steps:<COL_W$}"))
-        }
-
-        out.push_str("\nstrengths (y):");
-        
-        for strength in self.strengths() {
-            out.push_str(&format!("\n{strength}"))
-        }
-
-        out
     }
 }
 
@@ -418,8 +405,6 @@ impl ApplicationCommandInteractionHandler for DreamMatrixCommand {
             kind: DreamType::Matrix(cmd)
         };
 
-        let matrix = MatrixSize::from_str(&self.matrix_size).map_err(|_| InvocationError)?;
-        
         DREAM_POOL.send(task)
             .await
             .map_err(|_| InvocationError)?;
@@ -457,12 +442,7 @@ impl ApplicationCommandInteractionHandler for DreamMatrixCommand {
                             &self.init_image,
                             response, 
                             &res, 
-                            command);
-
-                        response.embed(|embed| embed
-                            .title("========= Matrix Parameters =========")
-                            .description(matrix.table())
-                        )
+                            command)
                     })
                     .await
                     .map_err(|e| {error!(?e, "matrix failed"); InvocationError })?;
@@ -662,6 +642,7 @@ impl CreateEmbedExt for CreateEmbed {
     }
 }
 
+/// Send followup message with dreaming result 
 fn create_dream_result<'a, 'b>(
     init_image: &'b Option<Attachment>,
     response: &'b mut CreateInteractionResponseFollowup<'a>,
@@ -677,34 +658,35 @@ fn create_dream_result<'a, 'b>(
                     (img, format!("{idx}.png"))
                 )
                 .collect();
-            let mut img_iter = imgs.iter();
-            let resp = response                       
+
+            response                       
                 .content(&command.user)
-                .embed(|embed| { 
-                    let mut embed = embed 
-                        .title("Generation result")
-                        .description(format!("Compute used: {:.2} sec", comp_time.as_secs_f32()))
-                        .field("Prompt", &info.prompt, false)                                
-                        .opt_field("Negative prompt", info.neg_prompt.as_ref(), false)
-                        .opt_field("Seed", info.seed, true)
-                        .opt_field("Sampler", info.sampler.as_ref(), true)
-                        .opt_field("Steps", info.steps, true)
-                        .opt_field("Scale", info.scale, true)
-                        .opt_field("Strength", info.strength, true)
-                        .opt_field("Width", info.width, true)
-                        .opt_field("Height", info.height, true)
-                        .attachment("result.png");
+                .embed(|embed| { embed 
+                    .title("Generation result")
+                    .description(format!("Compute used: {:.2} sec", comp_time.as_secs_f32()))
+                    .field("Prompt", &info.prompt, false)                                
+                    .opt_field("Negative prompt", info.neg_prompt.as_ref(), false)
+                    .opt_field("Seed", info.seed, true)
+                    .opt_field("Sampler", info.sampler.as_ref(), true)
+                    .opt_field("Steps", info.steps, true)
+                    .opt_field("Scale", info.scale, true)
+                    .opt_field("Strength", info.strength, true)
+                    .opt_field("Width", info.width, true)
+                    .opt_field("Height", info.height, true)
+                    .attachment("result.png");
 
                     if let Some(ref att) = init_image {
-                        embed = embed.thumbnail(&att.url)
+                        embed.thumbnail(&att.url);
                     }
 
                     embed
                 });
-                if let Some((first, _)) = img_iter.next() {
-                    resp.add_file((first.as_slice(), "result.png"));
-                }
-                resp.add_files(img_iter.map(|(img, name)| (img.as_slice(), name.as_str())))
+
+            if imgs.len() == 1 {
+                response.add_file((imgs[0].0.as_slice(), "result.png"))
+            } else {
+                response.add_files(imgs.iter().map(|(img, name)| (img.as_slice(), name.as_str())))
+            }
         }
         Err(err) => {
             response

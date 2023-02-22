@@ -9,6 +9,42 @@ use base64::{Engine, engine::general_purpose, DecodeError};
 use rand::Rng;
 use tokio::sync::RwLock;
 
+#[macro_export]
+/// Wrapper for choosing backend
+macro_rules! sd_generate {
+    ($req:expr) => {{
+        use $crate::sdapi::SdApi;
+        match $crate::CONFIG.sdapi_backend {
+            $crate::config::SdapiBackend::Webui => $crate::sdapi::WEBUI.generate($req),
+            $crate::config::SdapiBackend::Mock => $crate::sdapi::MOCK_API.generate($req)
+        }    
+    }} 
+}
+
+#[macro_export]
+/// Wrapper for choosing backend
+macro_rules! sd_progress {
+    () => {{
+        use $crate::sdapi::SdApi;
+        match $crate::CONFIG.sdapi_backend {
+            $crate::config::SdapiBackend::Webui => $crate::sdapi::WEBUI.progress(),
+            $crate::config::SdapiBackend::Mock => $crate::sdapi::MOCK_API.progress()
+        }     
+    }} 
+}
+
+#[macro_export]
+/// Wrapper for choosing backend
+macro_rules! sd_fill {
+    ($req:expr) => {{
+        use $crate::sdapi::SdApi;
+        match $crate::CONFIG.sdapi_backend {
+            $crate::config::SdapiBackend::Webui => $crate::sdapi::Webui::fill_request($req),
+            $crate::config::SdapiBackend::Mock => $crate::sdapi::MockSdApi::fill_request($req)
+        }    
+    }}
+}
+
 /// Webui singleton
 pub static WEBUI: Lazy<Webui> = Lazy::new(|| Webui { client: Client::new() }); 
 
@@ -175,12 +211,12 @@ impl SdApi for MockSdApi {
         let steps = req.steps.unwrap();
         self.progress.write().await.1 = steps;
         for step in 0..steps {
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
             self.progress.write().await.0 = step;
         }
         *self.progress.write().await = (0, 0);
         
-        let img = image::open("hanyuu.png")?
+        let img = image::load_from_memory(include_bytes!("../res/hanyuu.png"))?
             .resize_exact(req.width.unwrap(), req.height.unwrap(), FilterType::Triangle);
         
         let mut out = Cursor::new(vec![]);
