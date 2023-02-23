@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 pub enum SdapiBackend {
     Mock,
     Webui,
-    // Naifu,
+    Naifu,
 }
 
 #[derive(Deserialize, Serialize)]

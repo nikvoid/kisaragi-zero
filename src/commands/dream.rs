@@ -43,6 +43,7 @@ static DREAM_POOL: Lazy<mpsc::Sender<DreamTask>> = Lazy::new(|| {
                                     Ok(_) => tokio::time::sleep(UPDATE_INTERVAL).await,
                                     Err(_) => break,
                             }}
+                            tokio::time::sleep(Duration::from_millis(100)).await;
                         }
                     });
 
@@ -121,6 +122,7 @@ async fn generate_matrix(
                     Ok(_) => tokio::time::sleep(UPDATE_INTERVAL).await,
                     Err(_) => break,
             }}
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
     });
 
@@ -384,6 +386,7 @@ pub struct DreamMatrixCommand {
     #[choice("DPM fast")]
     sampler_name: Option<String>,
     /// Seed for generation
+    #[min = 0]
     seed: Option<i64>,
     /// Guidance scale
     #[min = 0]
@@ -416,7 +419,7 @@ impl DreamMatrixCommand {
         Ok(GenerationRequest {
             prompt: self.prompt,
             neg_prompt: self.negative_prompt,
-            seed: self.seed,
+            seed: self.seed.map(|s| s as u32),
             sampler: self.sampler_name,
             steps: None,
             scale: self.cfg_scale.map(|s| s as _),
@@ -557,6 +560,7 @@ pub struct DreamCommand {
     #[choice("DPM fast")]
     sampler_name: Option<String>,
     /// Seed for generation
+    #[min = 0]
     seed: Option<i64>,
     /// Initial image to use in img2img
     init_image: Option<Attachment>,
@@ -593,7 +597,7 @@ impl DreamCommand {
         Ok(GenerationRequest {
             prompt: self.prompt,
             neg_prompt: self.negative_prompt,
-            seed: self.seed,
+            seed: self.seed.map(|s| s as _),
             sampler: self.sampler_name,
             steps: self.steps.map(|s| s as _),
             scale: self.cfg_scale.map(|s| s as _),

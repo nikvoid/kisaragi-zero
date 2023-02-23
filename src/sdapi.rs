@@ -16,6 +16,7 @@ macro_rules! sd_generate {
         use $crate::sdapi::SdApi;
         match $crate::CONFIG.sdapi_backend {
             $crate::config::SdapiBackend::Webui => $crate::sdapi::WEBUI.generate($req),
+            $crate::config::SdapiBackend::Naifu => $crate::sdapi::NAIFU.generate($req),
             $crate::config::SdapiBackend::Mock => $crate::sdapi::MOCK_API.generate($req)
         }    
     }} 
@@ -28,6 +29,7 @@ macro_rules! sd_progress {
         use $crate::sdapi::SdApi;
         match $crate::CONFIG.sdapi_backend {
             $crate::config::SdapiBackend::Webui => $crate::sdapi::WEBUI.progress(),
+            $crate::config::SdapiBackend::Naifu => $crate::sdapi::NAIFU.progress(),
             $crate::config::SdapiBackend::Mock => $crate::sdapi::MOCK_API.progress()
         }     
     }} 
@@ -40,6 +42,7 @@ macro_rules! sd_fill {
         use $crate::sdapi::SdApi;
         match $crate::CONFIG.sdapi_backend {
             $crate::config::SdapiBackend::Webui => $crate::sdapi::Webui::fill_request($req),
+            $crate::config::SdapiBackend::Naifu => $crate::sdapi::Naifu::fill_request($req),
             $crate::config::SdapiBackend::Mock => $crate::sdapi::MockSdApi::fill_request($req)
         }    
     }}
@@ -51,6 +54,9 @@ pub static WEBUI: Lazy<Webui> = Lazy::new(|| Webui { client: Client::new() });
 /// Mock api singleton
 pub static MOCK_API: Lazy<MockSdApi> = Lazy::new(|| MockSdApi { progress: RwLock::new((0, 0)) });
 
+/// Naifu singleton
+pub static NAIFU: Lazy<Naifu> = Lazy::new(|| Naifu { client: Client::new() });
+
 pub type ImageVec = Vec<Vec<u8>>;
 pub type Progress = (u32, u32);
 
@@ -60,7 +66,7 @@ pub type Progress = (u32, u32);
 pub struct GenerationRequest {
     pub prompt: String,
     pub neg_prompt: Option<String>,
-    pub seed: Option<i64>,
+    pub seed: Option<u32>,
     pub sampler: Option<String>,
     pub steps: Option<u32>,
     pub scale: Option<u32>,
@@ -116,8 +122,8 @@ pub trait SdApi {
         }
 
         // Generate random seed
-        let seed: i32 = rand::thread_rng().gen();
-        req.seed.get_or_insert(seed as _);
+        let seed = rand::thread_rng().gen_range(0..u32::MAX);
+        req.seed.get_or_insert(seed);
         
         req.neg_prompt.get_or_insert(Self::NEG_PROMPT.to_string());
         req.sampler.get_or_insert(Self::SAMPLER.to_string());
@@ -196,6 +202,52 @@ impl SdApi for Webui {
 }
 
 #[async_trait]
+impl SdApi for Naifu {
+    const PROMPT: &'static str = "masterpiece, best quality";
+    const NEG_PROMPT: &'static str = 
+        "lowres, bad anatomy, bad hands, text, error,
+        missing fingers, extra digit, fewer digits, cropped, 
+        worst quality, low quality, normal quality, jpeg artifacts, 
+        signature, watermark, username, blurry";
+    const SAMPLER: &'static str = "Euler a";
+    const STEPS: u32 = 28;
+    const CFG_SCALE: u32 = 12;
+    const WIDTH: u32 = 512;
+    const HEIGHT: u32 = 512;
+    const STRENGTH: f64 = 0.69;
+
+    
+    async fn generate(&self, mut req: GenerationRequest) -> anyhow::Result<(ImageVec, GenerationRequest)> {
+        Self::fill_request(&mut req);
+
+        let request: NaifuGenerationRequest = req.clone().into();
+        let out: NaifuGenerationOutput = self.client
+            .post("http://127.0.0.1:6969/generate")
+            .json(&request)
+            .send()
+            .await?
+            .json()
+            .await?;
+
+        match out {
+            NaifuGenerationOutput { output: Some(output), .. } => {
+                let res: Result<Vec<_>, DecodeError> = output
+                    .into_iter()
+                    .map(|b64| general_purpose::STANDARD.decode(b64))
+                    .collect();
+                Ok((res?, req))
+            },
+            NaifuGenerationOutput { error: Some(error), .. } => anyhow::bail!(error), 
+            NaifuGenerationOutput { .. } => anyhow::bail!("unknown naifu error"), 
+        }
+    }
+    
+    async fn progress(&self) -> anyhow::Result<Progress> {
+        anyhow::bail!("not supported")
+    }
+}
+
+#[async_trait]
 impl SdApi for MockSdApi {
     const PROMPT: &'static str = "masterpiece, best quality";
     const NEG_PROMPT: &'static str = "(worst quality, low quality:1.4), bad anatomy, hands";
@@ -264,10 +316,38 @@ impl From<GenerationRequest> for WebuiRequestImg2Img {
     }
 }
 
+impl From<GenerationRequest> for NaifuGenerationRequest {
+    fn from(value: GenerationRequest) -> Self {
+        Self {
+            sampler: match value.sampler.unwrap().as_str() {
+                "Euler a" => "k_euler_ancestral",
+                "Euler" => "k_euler",
+                "LMS" => "k_lms",
+                "DDIM" => "ddim",
+                _ => "non-existent sampler"
+            }.to_string(),
+            height: value.height.unwrap(),
+            width: value.width.unwrap(),
+            n_samples: value.batch.unwrap(),
+            prompt: value.prompt,
+            scale: value.scale.unwrap() as f64,
+            seed: value.seed.unwrap(),
+            steps: value.steps.unwrap(),
+            strength: value.strength.unwrap(),
+            uc: value.neg_prompt.unwrap(),
+            image: value.init_images
+                .and_then(|v| v.into_iter()
+                    .next()
+                    .map(|img| general_purpose::STANDARD.encode(img.as_slice()))
+                ),
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct WebuiRequestTxt2Img {
     pub prompt: String,
-    pub seed: i64,
+    pub seed: u32,
     pub sampler_name: String,
     pub batch_size: u32,
     pub steps: u32,
@@ -303,6 +383,27 @@ struct WebuiProgressState {
     sampling_steps: u32,
 }
 
+#[derive(Serialize)]
+struct NaifuGenerationRequest {
+    height: u32,
+    width: u32,
+    sampler: String,
+    n_samples: u32,
+    prompt: String,
+    scale: f64,
+    seed: u32,
+    steps: u32,
+    strength: f64,
+    uc: String,
+    image: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct NaifuGenerationOutput {
+    output: Option<Vec<String>>,
+    error: Option<String>,
+}
+
 /// https://github.com/AUTOMATIC1111/stable-diffusion-webui
 pub struct Webui {
     client: Client
@@ -311,4 +412,9 @@ pub struct Webui {
 /// Api used for testing bot
 pub struct MockSdApi {
     progress: RwLock<Progress>
+}
+
+/// NovelAI leaked frontend
+pub struct Naifu {
+    client: Client
 }
