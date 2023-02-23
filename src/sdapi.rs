@@ -221,7 +221,7 @@ impl SdApi for MockSdApi {
         
         let mut out = Cursor::new(vec![]);
         img.write_to(&mut out, ImageFormat::Png)?;
-        Ok((vec![out.into_inner().clone(); req.batch.unwrap() as usize], req))
+        Ok((vec![out.into_inner(); req.batch.unwrap() as usize], req))
     }
     
     async fn progress(&self) -> anyhow::Result<Progress> {

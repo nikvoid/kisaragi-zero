@@ -4,7 +4,7 @@ use image::{RgbImage, ImageFormat, imageops::FilterType, Rgb};
 use imageproc::drawing;
 use once_cell::sync::Lazy;
 use rusttype::{Font, Scale};
-use serenity::builder::{CreateEmbed, CreateInteractionResponseFollowup};
+use serenity::{builder::CreateEmbed, http::Http, model::prelude::Message};
 use serenity::model::prelude::Attachment;
 use tokio::task::spawn_blocking;
 use tokio::sync::{watch, mpsc};
@@ -299,7 +299,7 @@ impl MatrixSize {
 
     /// Sum of all images' steps in matrix
     fn overall_steps(self) -> u32 {
-        self.steps().iter().map(|s| s * self.height() as u32).sum()
+        self.steps().iter().map(|s| s * self.height()).sum()
     }
 
     /// Return iterator over matrix.
@@ -499,17 +499,16 @@ impl ApplicationCommandInteractionHandler for DreamMatrixCommand {
                     }
                 }
                 DreamOutput::Result(mut res) => {
-                    command.create_followup_message(&ctx.http, |response| {
-                        if let Ok((_, ref mut info, _)) = res {
-                            info.steps = None;
-                            info.strength = None;
-                        }
-                        create_dream_result(
-                            &self.init_image,
-                            response, 
-                            &res, 
-                            command)
-                    })
+                    if let Ok((_, ref mut info, _)) = res {
+                        info.steps = None;
+                        info.strength = None;
+                    }
+                    create_dream_result(
+                        &ctx.http,
+                        &self.init_image,
+                        &res, 
+                        command
+                    )
                     .await
                     .map_err(|e| {error!(?e, "matrix failed"); InvocationError })?;
                     return Ok(())
@@ -669,13 +668,12 @@ impl ApplicationCommandInteractionHandler for DreamCommand {
                     } 
                 }
                 DreamOutput::Result(res) => {
-                    command.create_followup_message(&ctx.http, |response| 
-                        create_dream_result(
-                            &self.init_image,
-                            response, 
-                            &res, 
-                            command
-                    ))
+                    create_dream_result(
+                        &ctx.http,
+                        &self.init_image,
+                        &res, 
+                        command
+                    )
                     .await
                     .map_err(|e| {error!(?e, "dream failed"); InvocationError })?;
                     return Ok(()) 
@@ -708,13 +706,14 @@ impl CreateEmbedExt for CreateEmbed {
     }
 }
 
-/// Send followup message with dreaming result 
-fn create_dream_result<'a, 'b>(
+/// Send followup message (or fallback to normal message if interaction token invalidated)
+/// with dreaming result 
+async fn create_dream_result<'a, 'b>(
+    http: impl AsRef<Http>,
     init_image: &'b Option<Attachment>,
-    response: &'b mut CreateInteractionResponseFollowup<'a>,
     result: &'a DreamResult,
     command: &ApplicationCommandInteraction,
-) -> &'b mut CreateInteractionResponseFollowup<'a> {
+) -> Result<Message, serenity::Error> {
     match result {
         Ok((imgs, info, comp_time)) => {
             let imgs: Vec<_> = imgs
@@ -724,44 +723,67 @@ fn create_dream_result<'a, 'b>(
                     (img, format!("{idx}.png"))
                 )
                 .collect();
+            let files_iter = imgs.iter().map(|(img, name)| (img.as_slice(), name.as_str()));
 
-            response                       
+            let create_embed = for<'e> |embed: &'e mut CreateEmbed| -> &'e mut CreateEmbed 
+            { embed 
+                .title("Generation result")
+                .description(format!("Compute used: {:.2} sec", comp_time.as_secs_f32()))
+                .field("Prompt", &info.prompt, false)                                
+                .opt_field("Negative prompt", info.neg_prompt.as_ref(), false)
+                .opt_field("Seed", info.seed, true)
+                .opt_field("Sampler", info.sampler.as_ref(), true)
+                .opt_field("Steps", info.steps, true)
+                .opt_field("Scale", info.scale, true)
+                .opt_field("Strength", info.strength, true)
+                .opt_field("Width", info.width, true)
+                .opt_field("Height", info.height, true)
+                .attachment("result.png");
+
+                if let Some(ref att) = init_image {
+                    embed.thumbnail(&att.url);
+                }
+
+                embed
+            };
+
+            let res = command.create_followup_message(&http, |response| { response                       
                 .content(&command.user)
-                .embed(|embed| { embed 
-                    .title("Generation result")
-                    .description(format!("Compute used: {:.2} sec", comp_time.as_secs_f32()))
-                    .field("Prompt", &info.prompt, false)                                
-                    .opt_field("Negative prompt", info.neg_prompt.as_ref(), false)
-                    .opt_field("Seed", info.seed, true)
-                    .opt_field("Sampler", info.sampler.as_ref(), true)
-                    .opt_field("Steps", info.steps, true)
-                    .opt_field("Scale", info.scale, true)
-                    .opt_field("Strength", info.strength, true)
-                    .opt_field("Width", info.width, true)
-                    .opt_field("Height", info.height, true)
-                    .attachment("result.png");
+                .embed(create_embed);
 
-                    if let Some(ref att) = init_image {
-                        embed.thumbnail(&att.url);
+                // add file to embed or send separated
+                if imgs.len() == 1 {
+                    response.add_file((imgs[0].0.as_slice(), "result.png"))
+                } else {
+                    response.add_files(files_iter.clone())
+                }
+            }).await;
+
+            // Fallback to message if interaction was invalidated
+            if res.is_err() {
+                command.channel_id.send_message(&http, |msg| { msg
+                    .content(&command.user)
+                    .embed(create_embed);
+                 
+                    // add file to embed or send separated
+                    if imgs.len() == 1 {
+                        msg.add_file((imgs[0].0.as_slice(), "result.png"))
+                    } else {
+                        msg.add_files(files_iter)
                     }
-
-                    embed
-                });
-
-            // add file to embed or send separated
-            if imgs.len() == 1 {
-                response.add_file((imgs[0].0.as_slice(), "result.png"))
+                }).await
             } else {
-                response.add_files(imgs.iter().map(|(img, name)| (img.as_slice(), name.as_str())))
+                res
             }
         }
         Err(err) => {
-            response
+            command.channel_id.send_message(&http, |msg| msg
                 .content(&command.user)
                 .embed(|embed| embed
                     .title("Error generating response")
                     .description(err)
                 )
+            ).await
         }
     }
 }

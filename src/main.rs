@@ -1,5 +1,6 @@
 #![feature(fs_try_exists)]
 #![feature(try_blocks)]
+#![feature(closure_lifetime_binder)]
 
 use once_cell::sync::Lazy;
 use serenity::{
@@ -16,7 +17,7 @@ use serenity::{
 use slashies::{
     register_commands, Commands,
 };
-use tracing::{warn, info, error};
+use tracing::{info, error};
 
 mod commands;
 use commands::*;
