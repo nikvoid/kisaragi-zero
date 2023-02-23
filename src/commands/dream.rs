@@ -95,6 +95,10 @@ async fn generate_matrix(
     // Parse matrix size
     let matrix = MatrixSize::from_str(&cmd.matrix_size)?;
 
+    let mut req = cmd.into_request().await?;
+    sd_fill!(&mut req);
+    let use_cfg_scale = req.init_images.is_none();
+
     // Spawn watcher task
     let (curr_img_sendr, curr_img_watch) = watch::channel(0);
     let images = matrix.area();
@@ -106,7 +110,7 @@ async fn generate_matrix(
             if let Ok((cur_steps, _)) = sd_progress!().await {
                 let processed_imgs = *curr_img_watch.borrow();
                 // We can fold matrix iterator to find overall steps count
-                let steps_made = cur_steps + matrix.iter()
+                let steps_made = cur_steps + matrix.iter(use_cfg_scale)
                     .take(processed_imgs)
                     .map(|(_, steps)| steps)
                     .sum::<u32>(); 
@@ -120,8 +124,6 @@ async fn generate_matrix(
         }
     });
 
-    let mut req = cmd.into_request().await?;
-    sd_fill!(&mut req);
 
     let img_h = req.height.unwrap();
     let img_w = req.width.unwrap();
@@ -135,12 +137,18 @@ async fn generate_matrix(
     let mut buff = RgbImage::new(buf_w, buf_h);
 
     let start_time = tokio::time::Instant::now();        
-    
+
     // Process matrix, compose images
-    for ((strength, steps), (y, x)) in matrix.iter().zip(matrix.iter_yx()) {
+    for ((strength_scale, steps), (y, x)) in matrix.iter(use_cfg_scale).zip(matrix.iter_yx()) {
         let mut req = req.clone();
         req.steps = Some(steps);
-        req.strength = Some(strength);
+        
+        if use_cfg_scale {
+            req.scale = Some(strength_scale as u32);
+        } else {
+            req.strength = Some(strength_scale);
+        }
+        
         let png = sd_generate!(req).await?;
         let img = spawn_blocking(move || {
             let mut reader = image::io::Reader::new(Cursor::new(&png.0[0]));
@@ -166,7 +174,7 @@ async fn generate_matrix(
         &text
     );
 
-    // Draw steps
+    // Draw steps    
     for (x, steps) in matrix.steps().iter().enumerate() {
         let col_offset = UL_MARGIN + PADDING + (img_w + PADDING * 2) * x as u32;
 
@@ -179,11 +187,22 @@ async fn generate_matrix(
         draw_text(x_off as i32, y_off as i32, label);
     } 
     
-    // Draw strengths
-    for (y, strength) in matrix.strengths().iter().enumerate() {
+    // Draw strengths (or cfg scales)
+    let strength_scales = if !use_cfg_scale {
+        matrix.strengths()
+    } else {
+        matrix.cfg_scales()
+    };
+    
+    for (y, strength_scale) in strength_scales.iter().enumerate() {
         let row_offset = UL_MARGIN + PADDING + (img_h + PADDING * 2) * y as u32;
 
-        let label = format!("{strength:.2}");
+        let label = if use_cfg_scale {
+            format!("{strength_scale:.0}")
+        } else {
+            format!("{strength_scale:.2}")
+        };
+        
         let (text_w, text_h) = drawing::text_size(FONT_SCALE, &FONT, &label);
 
         let y_off = (img_h - text_h as u32) / 2 + row_offset;
@@ -266,7 +285,7 @@ impl MatrixSize {
             Self::M2x2 => &[7., 9.],
             Self::M3x3 => &[6., 7., 9.],
             Self::M5x5 => &[6., 7., 9., 12., 15.],
-            Self::M5x7 => &[5., 6., 7., 9., 12., 15., 18.],
+            Self::M5x7 => &[5., 6., 7.,  9., 12., 15., 18.],
         }
     }
 
@@ -283,9 +302,11 @@ impl MatrixSize {
         self.steps().iter().map(|s| s * self.height() as u32).sum()
     }
 
-    /// Return iterator over matrix
-    fn iter(self) -> impl Iterator<Item = (f64, u32)> {
-        self.strengths()
+    /// Return iterator over matrix.
+    ///
+    /// If `cfg_scale = true`, iterator will be over cfg scales 
+    fn iter(self, cfg_scale: bool) -> impl Iterator<Item = (f64, u32)> {
+        if !cfg_scale { self.strengths() } else { self.cfg_scales() } 
             .iter()
             .flat_map(move |&s| [s]
                 .into_iter()
@@ -325,7 +346,9 @@ impl FromStr for MatrixSize {
     }
 }
 
-/// Request image matrix generation
+/// Request image matrix generation.
+/// If init_image specified, generation will be with different steps and strengths
+/// Otherwise with steps and CFG Scales
 #[derive(Command, Clone)]
 #[name = "dream_matrix"]
 pub struct DreamMatrixCommand {
