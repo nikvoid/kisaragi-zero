@@ -3,16 +3,21 @@ use std::collections::HashMap;
 use serde::Deserialize;
 
 #[derive(Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum SdapiBackend {
     Mock,
-    Webui,
-    Naifu
+    Webui {
+        url: String
+    },
+    Naifu {
+        url: String,
+    }
 }
 
 #[derive(Deserialize, Clone, Copy)]
 #[serde(rename_all = "lowercase")]
 pub enum Access {
-    Public,
+ Public,
     Admin,
     Nobody
 }

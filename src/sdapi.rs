@@ -3,59 +3,60 @@ use std::{time::Duration, io::Cursor};
 use image::{imageops::FilterType, ImageFormat};
 use once_cell::sync::Lazy;
 use serde::{Serialize, Deserialize};
-use serenity::async_trait;
 use reqwest::{Client, StatusCode};
 use base64::{Engine, engine::general_purpose, DecodeError};
 use rand::Rng;
 use tokio::sync::RwLock;
 
-#[macro_export]
-/// Wrapper for choosing backend
-macro_rules! sd_generate {
-    ($req:expr) => {{
-        use $crate::sdapi::SdApi;
-        match $crate::CONFIG.sdapi_backend {
-            $crate::config::SdapiBackend::Webui => $crate::sdapi::WEBUI.generate($req),
-            $crate::config::SdapiBackend::Naifu => $crate::sdapi::NAIFU.generate($req),
-            $crate::config::SdapiBackend::Mock => $crate::sdapi::MOCK_API.generate($req)
-        }    
-    }} 
+use crate::{CONFIG, config::SdapiBackend};
+
+/// Enum for trait static dispatch
+pub enum SdBackend {
+    Webui(Webui),
+    Naifu(Naifu),
+    Mock(MockSdApi)
 }
 
-#[macro_export]
-/// Wrapper for choosing backend
-macro_rules! sd_progress {
-    () => {{
-        use $crate::sdapi::SdApi;
-        match $crate::CONFIG.sdapi_backend {
-            $crate::config::SdapiBackend::Webui => $crate::sdapi::WEBUI.progress(),
-            $crate::config::SdapiBackend::Naifu => $crate::sdapi::NAIFU.progress(),
-            $crate::config::SdapiBackend::Mock => $crate::sdapi::MOCK_API.progress()
-        }     
-    }} 
+impl SdApi for SdBackend {
+    fn fill_request(&self, req: &mut GenerationRequest) {
+        match self {
+            SdBackend::Webui(w) => w.fill_request(req),
+            SdBackend::Naifu(n) => n.fill_request(req),
+            SdBackend::Mock(m) => m.fill_request(req),
+        }
+    }
+    
+    async fn generate(&self, req: GenerationRequest) -> anyhow::Result<(ImageVec, GenerationRequest)> {
+        match self {
+            SdBackend::Webui(w) => w.generate(req).await,
+            SdBackend::Naifu(n) => n.generate(req).await,
+            SdBackend::Mock(m) => m.generate(req).await,
+        }
+    }
+
+    async fn progress(&self) -> anyhow::Result<Progress> {
+        match self {
+            SdBackend::Webui(w) => w.progress().await,
+            SdBackend::Naifu(n) => n.progress().await,
+            SdBackend::Mock(m) => m.progress().await,
+        }
+    }
 }
 
-#[macro_export]
-/// Wrapper for choosing backend
-macro_rules! sd_fill {
-    ($req:expr) => {{
-        use $crate::sdapi::SdApi;
-        match $crate::CONFIG.sdapi_backend {
-            $crate::config::SdapiBackend::Webui => $crate::sdapi::Webui::fill_request($req),
-            $crate::config::SdapiBackend::Naifu => $crate::sdapi::Naifu::fill_request($req),
-            $crate::config::SdapiBackend::Mock => $crate::sdapi::MockSdApi::fill_request($req)
-        }    
-    }}
-}
-
-/// Webui singleton
-pub static WEBUI: Lazy<Webui> = Lazy::new(|| Webui { client: Client::new() }); 
-
-/// Mock api singleton
-pub static MOCK_API: Lazy<MockSdApi> = Lazy::new(|| MockSdApi { progress: RwLock::new((0, 0)) });
-
-/// Naifu singleton
-pub static NAIFU: Lazy<Naifu> = Lazy::new(|| Naifu { client: Client::new() });
+/// Stable Diffusion backend singleton
+pub static SDAPI: Lazy<SdBackend> = Lazy::new(|| match &CONFIG.sdapi_backend {
+    SdapiBackend::Mock => SdBackend::Mock(MockSdApi { 
+        progress: RwLock::new((0, 0)) 
+    }),
+    SdapiBackend::Webui { url } => SdBackend::Webui(Webui { 
+        client: Client::new(), 
+        url: url.clone()  
+    }),
+    SdapiBackend::Naifu { url } => SdBackend::Naifu(Naifu { 
+        client: Client::new(), 
+        url: url.clone() 
+    }),
+});
 
 pub type ImageVec = Vec<Vec<u8>>;
 pub type Progress = (u32, u32);
@@ -93,20 +94,19 @@ impl GenerationRequest {
     }
 }
 
-#[async_trait]
 pub trait SdApi {
     // Default values
-    const PROMPT: &'static str;
-    const NEG_PROMPT: &'static str;
-    const SAMPLER: &'static str;
-    const STEPS: u32;
-    const CFG_SCALE: u32;
-    const WIDTH: u32;
-    const HEIGHT: u32;
-    const STRENGTH: f64;
+    const PROMPT: &'static str = "";
+    const NEG_PROMPT: &'static str = "";
+    const SAMPLER: &'static str = "";
+    const STEPS: u32 = 0;
+    const CFG_SCALE: u32 = 0;
+    const WIDTH: u32 = 0;
+    const HEIGHT: u32 = 0;
+    const STRENGTH: f64 = 0.;
 
     /// Fill unspecified fields with default parameters
-    fn fill_request(req: &mut GenerationRequest) {
+    fn fill_request(&self, req: &mut GenerationRequest) {
         // Append default prompt
         if !req.no_default_prompt {
             req.prompt.push_str(", ");
@@ -142,7 +142,6 @@ pub trait SdApi {
     async fn progress(&self) -> anyhow::Result<Progress>;
 }
 
-#[async_trait]
 impl SdApi for Webui {
     const PROMPT: &'static str = "masterpiece, best quality";
     const NEG_PROMPT: &'static str = "(worst quality, low quality:1.4), bad anatomy, hands";
@@ -154,11 +153,13 @@ impl SdApi for Webui {
     const STRENGTH: f64 = 0.75;
 
     async fn generate(&self, mut req: GenerationRequest) -> anyhow::Result<(ImageVec, GenerationRequest)> {
-        Self::fill_request(&mut req);
+        self.fill_request(&mut req);
         
         let builder = match req.get_type() {
-            GenerationType::Txt2Img => self.client.post("http://127.0.0.1:7860/sdapi/v1/txt2img"),
-            GenerationType::Img2Img => self.client.post("http://127.0.0.1:7860/sdapi/v1/img2img"),
+            GenerationType::Txt2Img => self.client
+                .post(format!("{}/sdapi/v1/txt2img", self.url)),
+            GenerationType::Img2Img => self.client
+                .post(format!("{}/sdapi/v1/img2img", self.url)),
         };
 
         let out_req = req.clone();
@@ -191,7 +192,8 @@ impl SdApi for Webui {
     }
     
     async fn progress(&self) -> anyhow::Result<Progress> {
-        let resp: WebuiProgress = self.client.get("http://127.0.0.1:7860/sdapi/v1/progress")
+        let resp: WebuiProgress = self.client
+            .get("http://127.0.0.1:7860/sdapi/v1/progress")
             .send()
             .await?
             .json()
@@ -201,7 +203,6 @@ impl SdApi for Webui {
     }
 }
 
-#[async_trait]
 impl SdApi for Naifu {
     const PROMPT: &'static str = "masterpiece, best quality";
     const NEG_PROMPT: &'static str = 
@@ -218,11 +219,11 @@ impl SdApi for Naifu {
 
     
     async fn generate(&self, mut req: GenerationRequest) -> anyhow::Result<(ImageVec, GenerationRequest)> {
-        Self::fill_request(&mut req);
+        self.fill_request(&mut req);
 
         let request: NaifuGenerationRequest = req.clone().into();
         let out: NaifuGenerationOutput = self.client
-            .post("http://127.0.0.1:6969/generate")
+            .post(format!("{}/generate", self.url))
             .json(&request)
             .send()
             .await?
@@ -247,7 +248,6 @@ impl SdApi for Naifu {
     }
 }
 
-#[async_trait]
 impl SdApi for MockSdApi {
     const PROMPT: &'static str = "masterpiece, best quality";
     const NEG_PROMPT: &'static str = "(worst quality, low quality:1.4), bad anatomy, hands";
@@ -259,7 +259,8 @@ impl SdApi for MockSdApi {
     const STRENGTH: f64 = 0.75;
     
     async fn generate(&self, mut req: GenerationRequest) -> anyhow::Result<(ImageVec, GenerationRequest)> {
-        Self::fill_request(&mut req);
+        self.fill_request(&mut req);
+        
         let steps = req.steps.unwrap();
         self.progress.write().await.1 = steps;
         for step in 0..steps {
@@ -277,7 +278,7 @@ impl SdApi for MockSdApi {
     }
     
     async fn progress(&self) -> anyhow::Result<Progress> {
-        return Ok(*self.progress.read().await)
+        Ok(*self.progress.read().await)
     }
 }
 
@@ -372,8 +373,8 @@ struct WebuiResponse {
 
 #[derive(Deserialize)]
 struct WebuiProgress {
-    progress: f64,
-    eta_relative: f64,
+    // progress: f64,
+    // eta_relative: f64,
     state: WebuiProgressState
 }
 
@@ -406,7 +407,8 @@ struct NaifuGenerationOutput {
 
 /// https://github.com/AUTOMATIC1111/stable-diffusion-webui
 pub struct Webui {
-    client: Client
+    client: Client,
+    url: String,
 }
 
 /// Api used for testing bot
@@ -416,5 +418,6 @@ pub struct MockSdApi {
 
 /// NovelAI leaked frontend
 pub struct Naifu {
-    client: Client
+    client: Client,
+    url: String
 }

@@ -1,6 +1,7 @@
 #![feature(fs_try_exists)]
 #![feature(try_blocks)]
 #![feature(closure_lifetime_binder)]
+#![feature(async_fn_in_trait)]
 
 use once_cell::sync::Lazy;
 use serenity::{

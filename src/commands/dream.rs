@@ -8,8 +8,7 @@ use serenity::{builder::CreateEmbed, http::Http, model::prelude::Message};
 use serenity::model::prelude::Attachment;
 use tokio::task::spawn_blocking;
 use tokio::sync::{watch, mpsc};
-use crate::{sd_fill, sd_generate, sd_progress};
-use crate::sdapi::{GenerationRequest, ImageVec, Progress};
+use crate::sdapi::{GenerationRequest, ImageVec, Progress, SDAPI, SdApi};
 use super::prelude::*;
 
 /// Progress watcher update interval
@@ -38,7 +37,7 @@ static DREAM_POOL: Lazy<mpsc::Sender<DreamTask>> = Lazy::new(|| {
                     // Spawn watcher task
                     tokio::spawn(async move {
                         loop {
-                            if let Ok(progress) = sd_progress!().await {
+                            if let Ok(progress) = SDAPI.progress().await {
                                 match progress_tx.send(DreamOutput::Progress(progress, (0, 1))).await {
                                     Ok(_) => tokio::time::sleep(UPDATE_INTERVAL).await,
                                     Err(_) => break,
@@ -49,12 +48,12 @@ static DREAM_POOL: Lazy<mpsc::Sender<DreamTask>> = Lazy::new(|| {
 
                     let start_time = tokio::time::Instant::now();        
        
-                    let res = cmd.into_request()
-                        .await
-                        .map(|req| sd_generate!(req));
-                    match res {
-                        Ok(r) => {
-                            let res = r.await.map(|r| (r.0, r.1, start_time.elapsed()));
+                    match cmd.into_request().await {
+                        Ok(req) => {
+                            let res = SDAPI
+                                .generate(req)
+                                .await
+                                .map(|r| (r.0, r.1, start_time.elapsed()));
                             msg.back_tx.send(DreamOutput::Result(res)).await.ok()
                         }
                         Err(e) => msg.back_tx.send(DreamOutput::Result(Err(e))).await.ok(),
@@ -97,7 +96,8 @@ async fn generate_matrix(
     let matrix = MatrixSize::from_str(&cmd.matrix_size)?;
 
     let mut req = cmd.into_request().await?;
-    sd_fill!(&mut req);
+    SDAPI.fill_request(&mut req);
+
     let use_cfg_scale = req.init_images.is_none();
 
     // Spawn watcher task
@@ -108,7 +108,7 @@ async fn generate_matrix(
             // FIXME: Implement overall steps report
             // Idea: calculate base from processed img count, add received to result
             // Buuuuut... Requested steps aren't always correspond to real...
-            if let Ok((cur_steps, _)) = sd_progress!().await {
+            if let Ok((cur_steps, _)) = SDAPI.progress().await {
                 let processed_imgs = *curr_img_watch.borrow();
                 // We can fold matrix iterator to find overall steps count
                 let steps_made = cur_steps + matrix.iter(use_cfg_scale)
@@ -151,7 +151,7 @@ async fn generate_matrix(
             req.strength = Some(strength_scale);
         }
         
-        let png = sd_generate!(req).await?;
+        let png = SDAPI.generate(req).await?;
         let img = spawn_blocking(move || {
             let mut reader = image::io::Reader::new(Cursor::new(&png.0[0]));
             reader.set_format(ImageFormat::Png);
@@ -515,7 +515,7 @@ impl ApplicationCommandInteractionHandler for DreamMatrixCommand {
 
 /// Request image generation
 #[derive(Command, Clone)]
-#[name = "dream_ng"]
+#[name = "dream"]
 pub struct DreamCommand {
     /// Prompt. Quality improving keywords will be appended
     prompt: String,
