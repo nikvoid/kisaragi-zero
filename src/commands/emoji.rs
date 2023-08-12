@@ -8,7 +8,7 @@ const EMOJI_DIR: &str = "emoji";
 ///
 /// Returns embed with emoji and requester name, if emoji exists
 pub async fn try_send_emoji(
-    msg: &mut Message,
+    msg: &Message,
     ctx: &Context,
 ) -> Option<Result<Message, SerenityError>> {
     let emo = &msg.content.as_str().strip_prefix(&crate::CONFIG.prefix).unwrap();

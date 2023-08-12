@@ -1,49 +1,47 @@
-use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
-#[derive(Deserialize, Serialize)]
+use serde::Deserialize;
+
+#[derive(Deserialize)]
 pub enum SdapiBackend {
     Mock,
     Webui,
-    Naifu,
+    Naifu
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+pub enum Access {
+    Public,
+    Admin,
+    Nobody
+}
+
+#[derive(Deserialize)]
 pub struct Config {
     pub token: String,
     pub app_id: u64,
-    pub target_guild: Option<u64>,
+    pub target_guilds: Vec<u64>,
     pub prefix: String,
     pub sdapi_backend: SdapiBackend, 
     pub admins: Vec<u64>,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            token: "PASTE_TOKEN_HERE".into(),
-            app_id: 0,
-            target_guild: Some(0),
-            prefix: "$$".into(),
-            sdapi_backend: SdapiBackend::Webui,
-            admins: vec![]
-        }
-    }
+    pub acl: HashMap<String, Access>
 }
 
 impl Config {
-    /// Load config from file. If file not exists, load default
+    /// Load config from file.
     pub fn load(path: &str) -> anyhow::Result<Self> {
-        match std::fs::read_to_string(path) {
-            Ok(s) => Ok(toml::from_str(&s)?), 
-            Err(e) => match e.kind() {
-                std::io::ErrorKind::NotFound => {
-                    let cfg = Self::default();
-                    let toml_str = toml::to_string_pretty(&cfg)?;
-                    std::fs::write(path, toml_str)?;
-                    Ok(cfg)
-                },
-                e => anyhow::bail!(e),
-            },
+        let s = std::fs::read_to_string(path)?;
+        let cfg = toml::from_str(&s)?;
+        Ok(cfg)
+    }
+
+    /// Return true if user has rights to use command
+    pub fn has_rights(&self, user_id: impl Into<u64>, cmd: &str) -> bool {
+        match self.acl.get(cmd).copied().unwrap_or(Access::Public) {
+            Access::Public => true,
+            Access::Admin => self.admins.contains(&user_id.into()),
+            Access::Nobody => false,
         }
     }
 }

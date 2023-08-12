@@ -15,7 +15,7 @@ use serenity::{
     Client,
 };
 use slashies::{
-    register_commands, Commands,
+    register_commands, Commands
 };
 use tracing::{info, error};
 
@@ -29,36 +29,58 @@ mod sdapi;
 
 struct Handler;
 
+#[allow(clippy::single_match)]
 #[async_trait]
 impl EventHandler for Handler {
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
         match interaction {
-            Interaction::ApplicationCommand(command_interaction) => {
-                BotCommands::parse(&ctx, &command_interaction)
-                    .expect("Failed to parse command")
-                    .invoke(&ctx, &command_interaction)
+            Interaction::ApplicationCommand(interaction) => {
+                let member = interaction.member.as_ref().unwrap();
+
+                if CONFIG.has_rights(member.user.id, &interaction.data.name) {
+                    BotCommands::parse(&ctx, &interaction)
+                        .expect("Failed to parse command")
+                        .invoke(&ctx, &interaction)
+                        .await
+                        .expect("Failed to invoke command");
+                } else {
+                    interaction.create_interaction_response(&ctx.http, |resp| resp
+                        .interaction_response_data(|data| data
+                            .content("You don't have rights to use this command")
+                        )
+                    )
                     .await
-                    .expect("Failed to invoke command");
+                    .expect("Failed to send response");
+                }                
             }
             _ => (),
         }
     }
 
-    async fn message(&self, ctx: Context, mut msg: Message) {
+    async fn message(&self, ctx: Context, msg: Message) {
         info!(
             msg = msg.content,
             guild = ?msg.guild_id,
             author = msg.author.name,
             "message"
         );
-        if msg.content.starts_with(&CONFIG.prefix) {
-            match try_send_emoji(&mut msg, &ctx).await {
-                Some(Ok(_)) => return,
-                Some(Err(e)) => error!(?e, "Failed to send emoji"),
-                None => ()
+        if let Some(cmd) = msg.content.strip_prefix(&CONFIG.prefix) {
+            if CONFIG.has_rights(msg.author.id, "emojis") {
+                match try_send_emoji(&msg, &ctx).await {
+                    Some(Ok(_)) => return,
+                    Some(Err(e)) => error!(?e, "Failed to send emoji"),
+                    None => ()
+                }
             }
 
-            match msg.content.strip_prefix(&CONFIG.prefix).unwrap() {
+            if !CONFIG.has_rights(msg.author.id, cmd) {
+                msg.reply(&ctx.http, "You don't have rights to use this command")
+                    .await
+                    .expect("Failed to reply");
+                return
+            }
+
+            match cmd {
                 "emojis" => if let Err(e) = send_emoji_list(&msg, &ctx).await {
                     error!(?e, "Failed to send emoji list")
                 },
@@ -67,31 +89,29 @@ impl EventHandler for Handler {
         }
     }
 
-    #[allow(deprecated)]
     async fn ready(&self, ctx: Context, ready: Ready) {
         info!("{} is connected!", ready.user.name);
 
-        let target = CONFIG.target_guild.map(GuildId);
-        
-        let commands = register_commands!(&ctx, target, [
-            HelloCommand,
-            RollCommand,
-            DreamCommand,
-            DreamMatrixCommand
-        ])
-        .expect("Unable to register commands");
-                
-        info!("Registered {} commands", commands.len());
+        for guild in &CONFIG.target_guilds {
+            match register_commands!(&ctx, Some(GuildId(*guild)), [
+                HelloCommand,
+                RollCommand,
+                DreamCommand,
+                DreamMatrixCommand
+            ]) {
+                Ok(cmds) =>         
+                    info!(guild, "Registered {} commands", cmds.len()),
+                Err(e) =>
+                    error!(guild, "Unable to regsiter commands: {e}")
+            };
+        }
     }
 }
 
-static CONFIG: Lazy<Config> = Lazy::new(|| 
-    Config::load("config.toml").expect("Failed to load config")
-);
-
-pub fn is_admin(id: u64) -> bool {
-    CONFIG.admins.contains(&id)
-}
+pub static CONFIG: Lazy<Config> = Lazy::new(|| {
+    let cfg = std::env::args().nth(1).unwrap_or("config.toml".into());
+    Config::load(&cfg).expect("Failed to load config")
+});
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()>  {

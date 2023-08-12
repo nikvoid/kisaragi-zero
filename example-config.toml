@@ -1,0 +1,43 @@
+# Application token and id.
+# Refer to discord docs on how to get them.
+token = "PASTE_YOUR_TOKEN"
+app_id = 0
+
+# Paste guild ids where you want to enable slash commands here
+target_guilds = [
+    0,
+]
+
+# Prefix for non-slash commands
+prefix = "$$"
+
+# Stable diffusion backend
+sdapi_backend = "Webui"
+
+# Ids of users that have admin rights
+admins = [
+    201985762143633408
+]
+
+# Access control list for commands
+# Options:
+# * public - everyone can use this command
+# * admin - only for admins
+# * nobody - nobody can use this command, even admin
+[acl]
+# /hello
+hello = "public"
+
+# /roll
+roll = "public"
+
+# /dream
+dream = "public"
+# /dream batch
+dream_batch = "admin"
+
+# /dream_matrix
+dream_matrix = "admin"
+
+# $$emojis, $$<emoji_name>
+emojis = "public"

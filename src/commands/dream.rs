@@ -446,11 +446,7 @@ impl ApplicationCommandInteractionHandler for DreamMatrixCommand {
     ) -> Result<(), InvocationError> {
         // Send queue pos response
         let queue_pos = get_queue_size();
-        let msg = if !crate::is_admin(command.user.id.0) {
-            "Only for admins".to_string()
-        } else {
-            format!("Queue position: #{queue_pos}")
-        };
+        let msg = format!("Queue position: #{queue_pos}");
         
         command
             .create_interaction_response(&ctx.http, |response| response
@@ -459,11 +455,6 @@ impl ApplicationCommandInteractionHandler for DreamMatrixCommand {
             )
             .await
             .map_err(|_| InvocationError)?;
-
-        // Admin check
-        if !crate::is_admin(command.user.id.0) {
-            return Ok(())   
-        } 
 
         let cmd = self.clone();
 
@@ -639,8 +630,8 @@ impl ApplicationCommandInteractionHandler for DreamCommand {
 
         let mut cmd = self.clone();
 
-        // Admin check
-        if !crate::is_admin(command.user.id.0) {
+        // Admin check - batch generation may consume much time
+        if !crate::CONFIG.has_rights(command.user.id, "dream_batch") {
             cmd.batch_size.replace(1);
         } 
         
