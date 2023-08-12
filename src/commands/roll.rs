@@ -1,4 +1,3 @@
-use chrono::Timelike;
 use rand::Rng;
 use super::prelude::*;
 
@@ -22,7 +21,6 @@ impl ApplicationCommandInteractionHandler for RollCommand {
         ctx: &Context,
         command: &ApplicationCommandInteraction,
     ) -> Result<(), InvocationError> {
-        let id = command.user.id.0;
         let user = &command.user.name;
 
         let dice = self.dice.as_str();
@@ -32,16 +30,6 @@ impl ApplicationCommandInteractionHandler for RollCommand {
             "d20" => 1..=20,            
             _ => panic!("unknown dice")
         };
-
-        let spec_range = match dice {
-            "d2" => 2..=2,
-            "d10" => 8..=10,
-            "d20" => 17..=20,
-            _ => todo!()
-        };
-
-        let is_spec = || id == 389528234070507541 || id == 201985762143633408;
-        let is_time = || chrono::Utc::now().minute() % 2 == 0;
 
         let msg = match self.count {
             Some(cnt @ 1..=100) => {
@@ -53,13 +41,11 @@ impl ApplicationCommandInteractionHandler for RollCommand {
                 }
                 buf
             },
-            _ => {
-                let res = if is_spec() && is_time() {
-                    info!("special case~~~");
-                    rand::thread_rng().gen_range(spec_range)                    
-                } else {
-                    rand::thread_rng().gen_range(range)
-                };
+            Some(_) => {
+                String::from("Cannot roll more than 100 times at once")
+            }
+            None => {
+                let res = rand::thread_rng().gen_range(range);
                 format!("{user} rolls {dice}: {res}")
             }
         };
