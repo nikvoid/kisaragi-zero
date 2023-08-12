@@ -1,0 +1,30 @@
+name: Build
+
+on: [push, pull_request]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - uses: actions/checkout@v2
+    - uses: actions-rs/toolchain@v1
+      with:
+          toolchain: nightly
+    - name: rust-cargo
+      uses: actions-rs/cargo@v1
+      with:
+        command: build
+        toolchain: nightly
+        args: --release
+        use-cross: false
+    - uses: actions/upload-artifact@v3
+      with:
+        name: kisaragi-zero-win64
+        path: |
+          target/release/kisaragi-zero.exe
+          emoji
+          example-config.toml
