@@ -12,6 +12,10 @@ target_guilds = [
 prefix = "$$"
 
 # Stable diffusion backend
+# Options: 
+# * webui.url = "http://127.0.0.1:7860"
+# * naifu.url = "http://127.0.0.1:6969"
+# * "mock"
 sdapi_backend.webui.url = "http://127.0.0.1:7860"
 
 # Ids of users that have admin rights
