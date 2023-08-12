@@ -20,7 +20,7 @@ sdapi_backend.webui.url = "http://127.0.0.1:7860"
 
 # Ids of users that have admin rights
 admins = [
-    201985762143633408
+    0,
 ]
 
 # Access control list for commands
